@@ -1,0 +1,3269 @@
+#!/bin/bash
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+DIM='\033[2m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+LAUNCHER="/usr/local/bin/DaggerLauncher"
+CONFIG_DIR="/etc/DaggerConnect"
+CONFIG=""
+CONFIG_FMT=""
+SERVICE_NAME=""
+SERVICE_FILE=""
+TRANSPORT=""
+XHTTP_CDN="false"
+XHTTP_CDN_HOST=""
+XHTTP_CDN_PORT="443"
+XHTTP_CDN_IPS=""
+XHTTP_INSECURE="true"
+XHTTP_ORIGIN_PORT="8443"
+XHTTP_PEER_IP=""
+XHTTP_PUBLIC_IP=""
+XHTTP_CDN_POOL="4"
+CHANNEL=""
+VERSION=""
+SERVER_PUBLIC_IP=""
+SSL_MODE=""
+DOMAIN=""
+CERT_FILE=""
+KEY_FILE=""
+
+_ts()   { date '+%H:%M:%S'; }
+info()  { echo -e "${DIM}$(_ts)${NC} ${CYAN}[INFO]${NC}  $*"; }
+ok()    { echo -e "${DIM}$(_ts)${NC} ${GREEN}[ OK ]${NC}  $*"; }
+warn()  { echo -e "${DIM}$(_ts)${NC} ${YELLOW}[WARN]${NC}  $*"; }
+step()  { echo -e "${DIM}$(_ts)${NC} ${MAGENTA}[STEP]${NC}  $*"; }
+
+error() { echo -e "${DIM}$(_ts)${NC} ${RED}[ERR ]${NC}  $*"; exit 1; }
+hr()    { echo -e "\n${BOLD}${CYAN}══ $* ══${NC}"; }
+
+ask() {
+    local var="$1" prompt="$2" default="$3"
+    if [ -n "$default" ]; then
+        echo -ne "${YELLOW}?${NC} $prompt [${default}]: "
+    else
+        echo -ne "${YELLOW}?${NC} $prompt: "
+    fi
+    read -r input
+    [ -z "$input" ] && [ -n "$default" ] && input="$default"
+    eval "$var=\"$input\""
+}
+
+ask_required() {
+    local var="$1" prompt="$2"
+    while true; do
+        ask "$var" "$prompt" ""
+        eval "local val=\$$var"
+        [ -n "$val" ] && break
+        warn "This field cannot be empty."
+    done
+}
+
+validate_label() {
+    echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'
+}
+
+ask_service_name() {
+    local svc_name svc_file
+
+    while true; do
+        ask LABEL "Service Name    (e.g. iran1, client-home, relay01)" ""
+        if [ -z "$LABEL" ]; then
+            warn "Service Name cannot be empty."
+            continue
+        fi
+        if ! validate_label "$LABEL"; then
+            warn "Only letters, numbers, - and _ are allowed."
+            continue
+        fi
+
+        svc_name="${LABEL}"
+        svc_file="/etc/systemd/system/${svc_name}.service"
+
+        if [ -f "$svc_file" ] || \
+           [ -f "${CONFIG_DIR}/${svc_name}.json" ] || \
+           [ -f "${CONFIG_DIR}/${svc_name}.yaml" ]; then
+            echo ""
+            warn "Already exists: ${svc_name}"
+            ask OVERWRITE "Overwrite? (y/n)" "n"
+            if [ "$OVERWRITE" = "y" ] || [ "$OVERWRITE" = "Y" ]; then
+                break
+            fi
+            info "Enter a different service name."
+            echo ""
+            continue
+        fi
+
+        break
+    done
+
+    while true; do
+        ask FMT "Config Format   (json/yaml)" "json"
+        case "$FMT" in
+            json|yaml) break ;;
+            *) warn "Please enter json or yaml." ;;
+        esac
+    done
+
+    CONFIG_FMT="$FMT"
+    SERVICE_NAME="${LABEL}"
+    SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+    CONFIG="${CONFIG_DIR}/${SERVICE_NAME}.${CONFIG_FMT}"
+
+    echo ""
+    info "Service Name : ${SERVICE_NAME}"
+    info "Config File  : ${CONFIG}"
+}
+
+detect_server_public_ip() {
+    if [ -n "$DC_SERVER_PUBLIC_IP" ]; then
+        echo "$DC_SERVER_PUBLIC_IP"
+        return 0
+    fi
+
+    local ip
+    # OFFLINE MODE: Removed external curl requests (ipify, ifconfig, icanhazip)
+    # Only use local routing table to guess the IP
+    ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+    if [ -n "$ip" ]; then
+        echo "$ip"
+        return 0
+    fi
+
+    return 1
+}
+
+validate_ip() {
+    echo "$1" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+}
+
+ask_server_public_ip() {
+    echo ""
+    local detected
+    detected=$(detect_server_public_ip)
+
+    if [ -n "$detected" ]; then
+        info "Public IP : ${detected}  (auto-detected locally)"
+        ask USE_DETECTED "Use this IP? (y/n)" "y"
+        if [ "$USE_DETECTED" = "y" ] || [ "$USE_DETECTED" = "Y" ]; then
+            SERVER_PUBLIC_IP="$detected"
+            return
+        fi
+    else
+        warn "Could not auto-detect this server's public IP locally."
+    fi
+
+    while true; do
+        ask SERVER_PUBLIC_IP "Enter server public IP manually" "$detected"
+        if [ -z "$SERVER_PUBLIC_IP" ]; then
+            warn "IP cannot be empty."
+            continue
+        fi
+        if validate_ip "$SERVER_PUBLIC_IP"; then
+            break
+        fi
+        warn "Invalid IP format. Example: 31.171.101.23"
+    done
+    info "Public IP : ${SERVER_PUBLIC_IP}  (manual)"
+}
+
+ask_transport() {
+    echo ""
+    echo -e "  ${BOLD}Available Transports:${NC}"
+    echo "    1)  tcp     — Raw TCP tunnel"
+    echo "    2)  ws      — WebSocket tunnel"
+    echo "    3)  wss     — WebSocket Secure (TLS) tunnel"
+    echo "    4)  http    — HTTP Mimicry tunnel"
+    echo "    5)  https   — HTTP Mimicry Secure (TLS) tunnel"
+    echo "    6)  quantum — Raw-packet tunnel"
+    echo "    7)  quantum+ — KCP over UDP "
+    echo "    8)  tun     — TUN kernel interface tunnel"
+    echo "    9)  xhttp   — real HTTP carrier (passes through a CDN)"
+    echo "   10)  xhttps  — real HTTPS carrier + Cloudflare edge addresses"
+    echo ""
+    while true; do
+        ask T_CHOICE "Transport" "1"
+        case "$T_CHOICE" in
+            1|tcp)     TRANSPORT="tcp";     break ;;
+            2|ws)      TRANSPORT="ws";      break ;;
+            3|wss)     TRANSPORT="wss";     break ;;
+            4|http)    TRANSPORT="http";    break ;;
+            5|https)   TRANSPORT="https";   break ;;
+            6|quantum) TRANSPORT="quantum"; break ;;
+            7|quantum+|quantumplus|qplus) TRANSPORT="quantum+"; break ;;
+            8|tun)     TRANSPORT="tun";     break ;;
+            9|xhttp)   TRANSPORT="xhttp";   break ;;
+            10|xhttps) TRANSPORT="xhttps";  break ;;
+            *) warn "Please enter 1-10 or transport name." ;;
+        esac
+    done
+    info "Transport : ${TRANSPORT}"
+}
+
+ask_xhttp() {
+    local side="$1"
+    echo ""
+    echo -e "  ${BOLD}xhttp settings${NC}"
+    echo -e "  ${DIM}The path is a URL prefix and must match on both ends.${NC}"
+    echo -e "  ${DIM}Pick something an ordinary site would have, not /tunnel.${NC}"
+    ask XHTTP_PATH "URL path  (must match the other side)" "/api/v2"
+    case "$XHTTP_PATH" in
+        /*) ;;
+        *) XHTTP_PATH="/$XHTTP_PATH" ;;
+    esac
+
+    if [ "$side" = "client" ]; then
+        echo ""
+        echo -e "  ${BOLD}How should uploads be sent?${NC}"
+        echo "    1)  auto       — try the fast way, fall back if the path won't carry it  (recommended)"
+        echo "    2)  streaming  — one long upload request. Fastest, but some CDNs buffer it and it stalls"
+        echo "    3)  sequenced  — many small upload requests. A little slower, gets through almost anything"
+        echo ""
+        echo -e "  ${DIM}Through Cloudflare, auto usually settles on sequenced after about${NC}"
+        echo -e "  ${DIM}20 seconds. Choosing sequenced outright skips that wait.${NC}"
+        echo ""
+        ask XHTTP_MODE_CHOICE "Upload mode" "1"
+        case "$XHTTP_MODE_CHOICE" in
+            2|stream|streaming|stream-up) XHTTP_MODE="stream-up" ;;
+            3|packet|sequenced|packet-up) XHTTP_MODE="packet-up" ;;
+            *) XHTTP_MODE="auto" ;;
+        esac
+        info "Upload mode : ${XHTTP_MODE}"
+    else
+        XHTTP_MODE="auto"
+    fi
+}
+
+ask_xhttp_cdn() {
+    local side="$1"
+    XHTTP_CDN="false"
+    XHTTP_CDN_HOST=""
+    XHTTP_CDN_PORT="443"
+    XHTTP_CDN_IPS=""
+    XHTTP_INSECURE="true"
+    XHTTP_ORIGIN_PORT="8443"
+    XHTTP_PEER_IP=""
+    XHTTP_PUBLIC_IP=""
+
+    echo ""
+    echo -e "  ${YELLOW}Answer the same on both sides.${NC}"
+    echo ""
+    ask XHTTP_CDN_CHOICE "Use Cloudflare (y/n)" "n"
+    case "$XHTTP_CDN_CHOICE" in
+        y|Y|yes) ;;
+        *) return ;;
+    esac
+
+    XHTTP_CDN="true"
+    XHTTP_INSECURE="false"
+
+    if [ "$side" = "client" ]; then
+        echo ""
+        echo -e "  ${BOLD}This side is the origin${NC}"
+        echo -e "  ${DIM}Cloudflare connects to THIS machine. Point your domain's DNS record${NC}"
+        echo -e "  ${DIM}here, orange cloud on, and open the port below in the firewall.${NC}"
+        echo ""
+        ask XHTTP_ORIGIN_PORT "Port to wait on" "8443"
+        ok "Waiting for Cloudflare on port ${XHTTP_ORIGIN_PORT}"
+
+        echo ""
+        local mine
+        mine=$(detect_server_public_ip)
+        while true; do
+            ask XHTTP_PUBLIC_IP "Client IP  (blank = skip)" "$mine"
+            [ -z "$XHTTP_PUBLIC_IP" ] && break
+            validate_ip "$XHTTP_PUBLIC_IP" && break
+            warn "That is not an IP address."
+        done
+        return
+    fi
+
+    ask_required XHTTP_CDN_HOST "Your Cloudflare-proxied domain  (e.g. cdn.example.com)"
+    echo ""
+    echo -e "  ${YELLOW}That domain's DNS record must point at the FOREIGN server,${NC}"
+    echo -e "  ${YELLOW}not at this one, with the orange cloud on.${NC}"
+    echo ""
+    echo -e "  ${DIM}Cloudflare forwards these HTTPS ports only:${NC}"
+    echo -e "  ${DIM}443, 2053, 2083, 2087, 2096, 8443${NC}"
+    echo -e "  ${DIM}Use the same port the far side waits on.${NC}"
+    ask XHTTP_CDN_PORT "Port" "443"
+    echo ""
+    echo -e "  ${BOLD}Edge addresses${NC}"
+    echo -e "  ${DIM}Every Cloudflare address accepts every domain behind Cloudflare and${NC}"
+    echo -e "  ${DIM}works out where to send the request from the domain name, not from${NC}"
+    echo -e "  ${DIM}the address dialled. So put any addresses that are not blocked from${NC}"
+    echo -e "  ${DIM}here, separated by commas. They are tried in order; if one stops${NC}"
+    echo -e "  ${DIM}working the next is used.${NC}"
+    echo -e "  ${DIM}Example: 104.17.12.5,162.159.36.7,172.67.180.44${NC}"
+    echo ""
+    while true; do
+        ask_required XHTTP_CDN_IPS "Edge addresses"
+        if validate_edge_ips "$XHTTP_CDN_IPS"; then
+            break
+        fi
+    done
+    XHTTP_CDN_IPS="$(normalize_edge_ips "$XHTTP_CDN_IPS")"
+    ok "Edge addresses: ${XHTTP_CDN_IPS}"
+
+    echo ""
+    echo -e "  ${BOLD}How many connections should it keep open?${NC}"
+    echo -e "  ${DIM}In Cloudflare mode this side dials, so the pool lives here.${NC}"
+    echo ""
+    ask XHTTP_CDN_POOL "Connections" "4"
+    case "$XHTTP_CDN_POOL" in
+        ''|*[!0-9]*) XHTTP_CDN_POOL="4" ;;
+    esac
+
+    echo ""
+    ask XHTTP_PEER_IP "Client IP  (blank = accept any)" ""
+    [ -n "$XHTTP_PEER_IP" ] && ok "Only ${XHTTP_PEER_IP} will be accepted"
+}
+
+validate_edge_ips() {
+    local list="$1" ip bad=0 count=0
+    IFS=',' read -ra _VIPS <<< "$list"
+    for ip in "${_VIPS[@]}"; do
+        ip="$(echo "$ip" | xargs)"
+        [ -z "$ip" ] && continue
+        count=$((count + 1))
+        if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            warn "\"${ip}\" is not an IP address."
+            bad=1
+            continue
+        fi
+        local o
+        for o in ${ip//./ }; do
+            if [ "$o" -gt 255 ] 2>/dev/null; then
+                warn "\"${ip}\" is not a valid IP address (${o} is above 255)."
+                bad=1
+                break
+            fi
+        done
+    done
+    if [ "$count" -eq 0 ]; then
+        warn "Enter at least one address."
+        return 1
+    fi
+    [ "$bad" -eq 0 ]
+}
+
+normalize_edge_ips() {
+    local list="$1" out="" ip
+    IFS=',' read -ra _NIPS <<< "$list"
+    for ip in "${_NIPS[@]}"; do
+        ip="$(echo "$ip" | xargs)"
+        [ -z "$ip" ] && continue
+        [ -n "$out" ] && out="${out},"
+        out="${out}${ip}"
+    done
+    printf '%s' "$out"
+}
+
+build_edge_ips_json() {
+    local ips="$1" out="" ip
+    [ -z "$ips" ] && { printf ''; return; }
+    IFS=',' read -ra _EIPS <<< "$ips"
+    for ip in "${_EIPS[@]}"; do
+        ip="$(echo "$ip" | xargs)"
+        [ -z "$ip" ] && continue
+        [ -n "$out" ] && out="${out}, "
+        out="${out}\"${ip}\""
+    done
+    printf '%s' "$out"
+}
+
+build_edge_ips_yaml() {
+    printf '[%s]' "$(build_edge_ips_json "$1")"
+}
+
+install_certbot() {
+    if command -v certbot &>/dev/null; then
+        ok "certbot already installed."
+        return
+    fi
+    info "Installing certbot..."
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq
+        apt-get install -y -qq certbot
+    elif command -v yum &>/dev/null; then
+        yum install -y -q certbot
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q certbot
+    else
+        error "Cannot install certbot — package manager not found. Install it manually."
+    fi
+    ok "certbot installed."
+}
+
+obtain_cert_auto() {
+    local domain="$1"
+    local cert_dir="/etc/letsencrypt/live/${domain}"
+
+    install_certbot
+
+    if ss -tlnp 2>/dev/null | grep -q ':80 '; then
+        warn "Port 80 is in use. Trying --webroot or stopping may be needed."
+        warn "Attempting standalone anyway (will fail if 80 is busy)."
+    fi
+
+    info "Obtaining SSL certificate for: ${domain}"
+    if certbot certonly \
+        --standalone \
+        --non-interactive \
+        --agree-tos \
+        --register-unsafely-without-email \
+        -d "$domain" \
+        --http-01-port 80 2>&1 | grep -E "Congratulations|Certificate|error|Error|failed|Failed"; then
+        ok "Certificate obtained successfully."
+    else
+        error "certbot failed. Make sure port 80 is open and domain points to this server."
+    fi
+
+    CERT_FILE="${cert_dir}/fullchain.pem"
+    KEY_FILE="${cert_dir}/privkey.pem"
+
+    if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
+        error "Certificate files not found at ${cert_dir}"
+    fi
+
+    ok "Cert : ${CERT_FILE}"
+    ok "Key  : ${KEY_FILE}"
+
+    local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+    mkdir -p "$hook_dir"
+    cat > "${hook_dir}/daggerconnect-${SERVICE_NAME}.sh" << EOF
+#!/bin/bash
+systemctl restart ${SERVICE_NAME} 2>/dev/null || true
+EOF
+    chmod +x "${hook_dir}/daggerconnect-${SERVICE_NAME}.sh"
+    ok "Auto-renew hook installed."
+}
+
+install_openssl() {
+    command -v openssl &>/dev/null && return
+    info "Installing openssl..."
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq && apt-get install -y -qq openssl
+    elif command -v yum &>/dev/null; then
+        yum install -y -q openssl
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q openssl
+    else
+        error "Cannot install openssl — package manager not found. Install it manually."
+    fi
+}
+
+make_self_signed_cert() {
+    local domain="$1"
+    local dir="/etc/daggerconnect/tls"
+
+    install_openssl
+    mkdir -p "$dir"
+    CERT_FILE="${dir}/${SERVICE_NAME}.crt"
+    KEY_FILE="${dir}/${SERVICE_NAME}.key"
+
+    info "Creating a self-signed certificate for ${domain} ..."
+    if ! openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+            -keyout "$KEY_FILE" -out "$CERT_FILE" \
+            -subj "/CN=${domain}" \
+            -addext "subjectAltName=DNS:${domain}" >/dev/null 2>&1; then
+        openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+            -keyout "$KEY_FILE" -out "$CERT_FILE" \
+            -subj "/CN=${domain}" >/dev/null 2>&1 \
+            || error "openssl could not create the certificate."
+    fi
+    chmod 600 "$KEY_FILE"
+    chmod 644 "$CERT_FILE"
+    ok "Cert : ${CERT_FILE}"
+    ok "Key  : ${KEY_FILE}"
+    ok "Valid for 10 years. Set Cloudflare's SSL mode to \"Full\"."
+}
+
+ask_ssl_cert() {
+    echo ""
+    echo -e "  ${BOLD}Certificate:${NC}"
+    echo "    1)  Self-signed  — made here with openssl (use Cloudflare SSL mode \"Full\")"
+    echo "    2)  Let's Encrypt — certbot, needs port 80 open and DNS pointing here"
+    echo "    3)  Custom        — paths to a cert and key you already have"
+    echo ""
+    while true; do
+        ask SSL_CHOICE "Certificate" "1"
+        case "$SSL_CHOICE" in
+            1|self|selfsigned) SSL_MODE="self";   break ;;
+            2|auto|letsencrypt) SSL_MODE="auto";  break ;;
+            3|custom)          SSL_MODE="custom"; break ;;
+            *) warn "Please enter 1, 2 or 3." ;;
+        esac
+    done
+
+    case "$SSL_MODE" in
+        self)
+            echo ""
+            local def_domain="${XHTTP_CDN_HOST:-daggerconnect.local}"
+            ask DOMAIN "Domain name" "$def_domain"
+            echo ""
+            make_self_signed_cert "$DOMAIN"
+            ;;
+        auto)
+            echo ""
+            ask_required DOMAIN "Domain name  (e.g. tunnel.example.com)"
+            echo ""
+            obtain_cert_auto "$DOMAIN"
+            ;;
+        custom)
+            echo ""
+            while true; do
+                ask_required CERT_FILE "Certificate file path  (e.g. /etc/ssl/certs/cert.pem)"
+                [ -f "$CERT_FILE" ] && break
+                warn "File not found: ${CERT_FILE}"
+            done
+            while true; do
+                ask_required KEY_FILE "Private key file path  (e.g. /etc/ssl/private/key.pem)"
+                [ -f "$KEY_FILE" ] && break
+                warn "File not found: ${KEY_FILE}"
+            done
+            echo ""
+            ok "Cert : ${CERT_FILE}"
+            ok "Key  : ${KEY_FILE}"
+            ;;
+    esac
+}
+
+check_ptrace_scope() {
+    local f=/proc/sys/kernel/yama/ptrace_scope
+    [ -r "$f" ] || return 0
+    local val
+    val=$(cat "$f" 2>/dev/null)
+    if [ "$val" = "0" ]; then
+        echo ""
+        warn "kernel.yama.ptrace_scope is 0 -- any same-user process can ptrace-attach and dump this binary from memory."
+        echo -e "  ${DIM}Recommended: sysctl -w kernel.yama.ptrace_scope=2   (or 3, which needs a reboot to undo)${NC}"
+        echo -e "  ${DIM}Persist across reboots: echo 'kernel.yama.ptrace_scope=2' >> /etc/sysctl.d/99-daggerconnect.conf${NC}"
+    fi
+}
+
+tune_network() {
+    hr "Network Tuning (fq + BBR, big buffers)"
+
+    local sysctl_file="/etc/sysctl.d/99-daggerconnect-net.conf"
+    step "Writing ${sysctl_file}"
+    cat > "$sysctl_file" << 'EOF'
+# DaggerConnect network tuning -- managed by setup.sh (safe to keep).
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 16777216
+net.core.wmem_default = 16777216
+net.core.optmem_max = 65536
+net.core.netdev_max_backlog = 250000
+net.core.somaxconn = 8192
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_rmem = 4096 131072 67108864
+net.ipv4.tcp_wmem = 4096 131072 67108864
+net.ipv4.udp_rmem_min = 131072
+net.ipv4.udp_wmem_min = 131072
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF
+
+    modprobe tcp_bbr 2>/dev/null || true
+    if [ ! -f /etc/modules-load.d/daggerconnect-bbr.conf ]; then
+        echo "tcp_bbr" > /etc/modules-load.d/daggerconnect-bbr.conf 2>/dev/null || true
+    fi
+
+    step "Applying now (sysctl)"
+    if sysctl -p "$sysctl_file" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1; then
+        ok "Applied and persisted (survives reboot)."
+    else
+        warn "Could not apply all sysctls now -- they will still take effect on next reboot."
+    fi
+
+    local cc qd
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    info "Congestion control: ${BOLD}${cc:-unknown}${NC}   qdisc: ${BOLD}${qd:-unknown}${NC}"
+    if [ "$cc" != "bbr" ]; then
+        warn "BBR not active (kernel may lack tcp_bbr). Throughput tuning still applied; consider a newer kernel for BBR."
+    fi
+    echo ""
+}
+
+ensure_launcher() {
+    local role="$1"
+    if [ -f "$LAUNCHER" ]; then
+        chmod +x "$LAUNCHER"
+        return 0
+    fi
+
+    # OFFLINE MODE: Load from local directory instead of downloading
+    if [ -f "./DaggerLauncher" ]; then
+        info "Loading DaggerLauncher from current directory (Offline Mode)..."
+        cp "./DaggerLauncher" "$LAUNCHER"
+        chmod +x "$LAUNCHER"
+        ok "DaggerLauncher loaded locally"
+        return 0
+    fi
+
+    error "DaggerLauncher not found at ${LAUNCHER} or ./DaggerLauncher. Please place the binary manually and re-run."
+}
+
+update_launcher() {
+    hr "Update Launcher"
+    echo ""
+
+    # OFFLINE MODE: Check for local file instead of downloading from GitHub
+    if [ -f "./DaggerLauncher" ]; then
+        ask USE_LOCAL "Found ./DaggerLauncher in current directory. Use it to update? (y/n)" "y"
+        if [ "$USE_LOCAL" = "y" ] || [ "$USE_LOCAL" = "Y" ]; then
+            cp -f "./DaggerLauncher" "$LAUNCHER"
+            chmod +x "$LAUNCHER"
+            ok "DaggerLauncher updated from local file."
+            
+            mapfile -t SERVICES < <(list_services)
+            local running=()
+            for svc in "${SERVICES[@]}"; do
+                systemctl is-active --quiet "$svc" && running+=("$svc")
+            done
+
+            if [ ${#running[@]} -eq 0 ]; then
+                info "No running services to restart. The new launcher will be used the next time a service starts."
+                return 0
+            fi
+
+            echo ""
+            echo "  Currently running: ${running[*]}"
+            echo ""
+            ask RESTART_NOW "Restart these now so the update takes effect? (y/n)" "y"
+            if [ "$RESTART_NOW" = "y" ] || [ "$RESTART_NOW" = "Y" ]; then
+                for svc in "${running[@]}"; do
+                    step "Restarting ${svc} ..."
+                    systemctl restart "$svc"
+                    sleep 2
+                    if systemctl is-active --quiet "$svc"; then ok "Running."; else warn "Failed to start -- check: journalctl -u ${svc}"; fi
+                done
+            else
+                warn "Not restarted -- the update won't take effect until you restart manually."
+            fi
+            return 0
+        fi
+    fi
+
+    warn "Offline mode: No local update file (./DaggerLauncher) found."
+    info "To update manually, place the new binary in the current directory as 'DaggerLauncher' and run this option again,"
+    info "or directly replace ${LAUNCHER} and restart your services."
+}
+
+ask_version() {
+    local role="$1"
+    # OFFLINE MODE: Skip launcher version fetching to avoid network calls
+    ask_channel_manual
+}
+
+ask_channel_manual() {
+    echo ""
+    echo -e "  ${BOLD}Release Channel:${NC}"
+    echo "    1)  release  — Stable (recommended)"
+    echo "    2)  beta     — Early access to new features, may be less stable"
+    echo ""
+    while true; do
+        ask CH_CHOICE "Channel" "1"
+        case "$CH_CHOICE" in
+            1|release) CHANNEL="release"; break ;;
+            2|beta)    CHANNEL="beta";    break ;;
+            *) warn "Please enter 1 (release) or 2 (beta)." ;;
+        esac
+    done
+    info "Channel : ${CHANNEL}"
+
+    echo ""
+    echo -e "  ${DIM}Pin a specific version (e.g. v3.3.1), or leave empty to always${NC}"
+    echo -e "  ${DIM}track the newest version released on the '${CHANNEL}' channel.${NC}"
+    while true; do
+        ask VER_INPUT "Version  (empty = latest)" ""
+        if [ -z "$VER_INPUT" ]; then
+            VERSION="latest"
+            break
+        fi
+        if echo "$VER_INPUT" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            VERSION="$VER_INPUT"
+            break
+        fi
+        warn "Invalid format. Use vN.N.N (e.g. v3.3.1), or leave empty for latest."
+    done
+    info "Version : ${VERSION}"
+}
+
+switch_channel() {
+    hr "Switch Release Channel / Version"
+    echo ""
+    pick_service "Switch channel for" || return 0
+    local svc="${PICKED_SVC%.service}"
+    local svc_file="/etc/systemd/system/${PICKED_SVC}"
+
+    local cur_channel="release" cur_version="latest"
+    if grep -q '^Environment=DC_CHANNEL=' "$svc_file" 2>/dev/null; then
+        cur_channel=$(grep '^Environment=DC_CHANNEL=' "$svc_file" | head -1 | sed -E 's/^Environment=DC_CHANNEL=//')
+    fi
+    if grep -q '^Environment=DC_VERSION=' "$svc_file" 2>/dev/null; then
+        cur_version=$(grep '^Environment=DC_VERSION=' "$svc_file" | head -1 | sed -E 's/^Environment=DC_VERSION=//')
+    fi
+    echo ""
+    info "Current: channel=${cur_channel} version=${cur_version}"
+
+    local svc_role=""
+    for cfg_candidate in "${CONFIG_DIR}/${svc}.json" "${CONFIG_DIR}/${svc}.yaml"; do
+        [ -f "$cfg_candidate" ] || continue
+        if grep -qE '"mode"[[:space:]]*:[[:space:]]*"server"|^[[:space:]]*mode[[:space:]]*:[[:space:]]*server' "$cfg_candidate"; then
+            svc_role="server"; break
+        elif grep -qE '"mode"[[:space:]]*:[[:space:]]*"client"|^[[:space:]]*mode[[:space:]]*:[[:space:]]*client' "$cfg_candidate"; then
+            svc_role="client"; break
+        fi
+    done
+
+    if [ -n "$svc_role" ]; then
+        ask_version "$svc_role"
+    else
+        warn "Could not determine whether '${svc}' is a server or client from its config -- falling back to manual entry."
+        ask_channel_manual
+    fi
+    local new_channel="$CHANNEL" new_version="$VERSION"
+
+    if [ "$new_channel" = "$cur_channel" ] && [ "$new_version" = "$cur_version" ]; then
+        ok "Already on channel=${cur_channel} version=${cur_version}. Nothing to do."
+        return 0
+    fi
+
+    set_unit_env() {
+        local key="$1" val="$2"
+        if grep -q "^Environment=${key}=" "$svc_file"; then
+            sed -i "s|^Environment=${key}=.*|Environment=${key}=${val}|" "$svc_file"
+        else
+            sed -i "/^\[Service\]/a Environment=${key}=${val}" "$svc_file"
+        fi
+    }
+
+    set_unit_env DC_CHANNEL "$new_channel"
+    set_unit_env DC_VERSION "$new_version"
+    systemctl daemon-reload
+
+    step "Restarting ${svc} on channel=${new_channel} version=${new_version} ..."
+    systemctl restart "$svc"
+    sleep 2
+    if systemctl is-active --quiet "$svc"; then
+        ok "Now running on channel=${new_channel} version=${new_version}."
+    else
+        warn "Service failed to start on the new setting -- reverting. Logs:"
+        journalctl -u "$svc" -n 20 --no-pager
+        set_unit_env DC_CHANNEL "$cur_channel"
+        set_unit_env DC_VERSION "$cur_version"
+        systemctl daemon-reload
+        systemctl restart "$svc"
+    fi
+}
+
+ask_ports() {
+    echo ""
+    echo -e "  Ports to forward. One per line, or comma-separated. Empty line when done."
+    echo -e "        Example : 22                   (bind :22 -> target :22)"
+    echo -e "        Example : 2222=22              (bind :2222 -> target :22)"
+    echo -e "        Example : 800,3005,4155,6550   (multiple at once, same type)"
+    echo -e "  ${DIM}You'll be asked TCP or UDP for each line. Most things (websites, SSH, RDP) are TCP;${NC}"
+    echo -e "  ${DIM}VPN-style tools (WireGuard, Cisco AnyConnect) are UDP.${NC}"
+    PORTS=()
+    while true; do
+        ask P "Port" ""
+        [ -z "$P" ] && break
+        local ptype
+        while true; do
+            ask ptype "Type for '$P' - tcp or udp" "tcp"
+            ptype="$(echo "$ptype" | tr '[:upper:]' '[:lower:]')"
+            case "$ptype" in
+                tcp|udp) break ;;
+                *) warn "Please type 'tcp' or 'udp'." ;;
+            esac
+        done
+        IFS="," read -ra _parts <<< "$P"
+        for _p in "${_parts[@]}"; do
+            _p="${_p// /}"
+            [ -z "$_p" ] && continue
+            if [[ "$_p" == */* ]]; then
+                PORTS+=("$_p")
+            else
+                PORTS+=("${_p}/${ptype}")
+            fi
+        done
+    done
+    if [ ${#PORTS[@]} -eq 0 ]; then
+        warn "No ports defined. Adding default 2222=22."
+        PORTS=("2222=22")
+    fi
+}
+
+parse_port_entry() {
+    local entry="$1" ptype="tcp" pbind ptarget
+    if [[ "$entry" == */* ]]; then
+        ptype="${entry##*/}"
+        entry="${entry%/*}"
+        ptype="$(echo "$ptype" | tr '[:upper:]' '[:lower:]')"
+        case "$ptype" in
+            udp|both|any) ;;
+            *) ptype="tcp" ;;
+        esac
+    fi
+    if [[ "$entry" == *=* ]]; then
+        pbind="${entry%%=*}"
+        ptarget="${entry#*=}"
+    else
+        pbind="$entry"
+        ptarget="$entry"
+    fi
+    echo "${ptype}|${pbind}|${ptarget}"
+}
+
+build_ports_json() {
+    local first=1 p ptype pbind ptarget
+    for p in "$@"; do
+        IFS='|' read -r ptype pbind ptarget <<< "$(parse_port_entry "$p")"
+        if [ "$first" = "1" ]; then
+            printf '    { "type": "%s", "bind": "0.0.0.0:%s", "target": "127.0.0.1:%s" }' "$ptype" "$pbind" "$ptarget"
+            first=0
+        else
+            printf ',
+    { "type": "%s", "bind": "0.0.0.0:%s", "target": "127.0.0.1:%s" }' "$ptype" "$pbind" "$ptarget"
+        fi
+    done
+    echo ""
+}
+
+build_ports_yaml() {
+    local p ptype pbind ptarget
+    for p in "$@"; do
+        IFS='|' read -r ptype pbind ptarget <<< "$(parse_port_entry "$p")"
+        printf '      - type: "%s"
+        bind: "0.0.0.0:%s"
+        target: "127.0.0.1:%s"
+' "$ptype" "$pbind" "$ptarget"
+    done
+}
+
+SOCKS5_ENABLED="false"
+SOCKS5_BIND=""
+
+CLIENT_CONN_POOL="8"
+
+ask_connection_pool() {
+    echo ""
+    echo -e "  ${BOLD}Connection Pool:${NC}"
+    echo -e "        Multiple parallel connections per path -- if one drops, the"
+    echo -e "        others keep traffic flowing while it reconnects."
+    echo ""
+    ask CLIENT_CONN_POOL "Connections per path" "8"
+}
+
+ask_socks5() {
+    echo ""
+    echo -e "  ${BOLD}Standalone SOCKS5 Proxy:${NC}"
+    echo -e "        Independent of the transport and port maps above — opens a local"
+    echo -e "        SOCKS5 proxy on this server whose traffic is tunneled to the client."
+    echo ""
+    ask SOCKS5_CHOICE "Enable SOCKS5 proxy? (y/n)" "n"
+    if [ "$SOCKS5_CHOICE" = "y" ] || [ "$SOCKS5_CHOICE" = "Y" ]; then
+        SOCKS5_ENABLED="true"
+        ask SOCKS5_BIND "SOCKS5 bind address  (keep on 127.0.0.1 unless you add auth)" "127.0.0.1:6060"
+    else
+        SOCKS5_ENABLED="false"
+        SOCKS5_BIND=""
+    fi
+}
+
+ADV_AUTO_TUNE="true"
+TUN_TUNE_PROFILE="auto"
+TUN_ENCRYPT="true"
+TUN_MTU=""
+TUN_SOCK_BUF=""
+TUN_RX_QUEUE=""
+TUN_TXQUEUELEN=""
+ADV_PROFILE="auto"
+ADV_TCP_KEEPALIVE="1"
+ADV_CONN_TIMEOUT="30"
+ADV_SESSION_TIMEOUT="60"
+ADV_CLEANUP_INTERVAL="3"
+ADV_TCP_READ_BUF="4194304"
+ADV_TCP_WRITE_BUF="4194304"
+ADV_UDP_BUF="4194304"
+ADV_CHANNEL_BACKLOG="4096"
+ADV_STREAM_CHAN_BUF="512"
+ADV_KEEPALIVE_SEC="15"
+ADV_DEAD_TIMEOUT_SEC="60"
+
+apply_profile() {
+    local p="$1"
+    ADV_PROFILE="$p"
+    case "$p" in
+        stable)
+            ADV_TCP_READ_BUF="4194304"   ADV_TCP_WRITE_BUF="4194304"
+            ADV_UDP_BUF="4194304"
+            ADV_CHANNEL_BACKLOG="4096"   ADV_STREAM_CHAN_BUF="512"
+            ADV_TCP_KEEPALIVE="1"        ADV_CONN_TIMEOUT="30"
+            ADV_SESSION_TIMEOUT="60"     ADV_CLEANUP_INTERVAL="3"
+            ADV_KEEPALIVE_SEC="15"       ADV_DEAD_TIMEOUT_SEC="60"
+            ;;
+        aggressive)
+            ADV_TCP_READ_BUF="16777216"  ADV_TCP_WRITE_BUF="16777216"
+            ADV_UDP_BUF="16777216"
+            ADV_CHANNEL_BACKLOG="8192"   ADV_STREAM_CHAN_BUF="2048"
+            ADV_TCP_KEEPALIVE="1"        ADV_CONN_TIMEOUT="60"
+            ADV_SESSION_TIMEOUT="120"    ADV_CLEANUP_INTERVAL="5"
+            ADV_KEEPALIVE_SEC="20"       ADV_DEAD_TIMEOUT_SEC="80"
+            ;;
+        low_latency)
+            ADV_TCP_READ_BUF="2097152"   ADV_TCP_WRITE_BUF="2097152"
+            ADV_UDP_BUF="2097152"
+            ADV_CHANNEL_BACKLOG="2048"   ADV_STREAM_CHAN_BUF="256"
+            ADV_TCP_KEEPALIVE="1"        ADV_CONN_TIMEOUT="15"
+            ADV_SESSION_TIMEOUT="30"     ADV_CLEANUP_INTERVAL="2"
+            ADV_KEEPALIVE_SEC="10"       ADV_DEAD_TIMEOUT_SEC="30"
+            ;;
+        low_hardware)
+            ADV_TCP_READ_BUF="524288"    ADV_TCP_WRITE_BUF="524288"
+            ADV_UDP_BUF="524288"
+            ADV_CHANNEL_BACKLOG="512"    ADV_STREAM_CHAN_BUF="128"
+            ADV_TCP_KEEPALIVE="5"        ADV_CONN_TIMEOUT="20"
+            ADV_SESSION_TIMEOUT="45"     ADV_CLEANUP_INTERVAL="3"
+            ADV_KEEPALIVE_SEC="30"       ADV_DEAD_TIMEOUT_SEC="90"
+            ;;
+    esac
+}
+
+ask_num_range() {
+    local __var="$1" prompt="$2" def="$3" lo="$4" hi="$5" val
+    while true; do
+        ask val "$prompt" "$def"
+        case "$val" in
+            ''|*[!0-9]*) warn "Enter a whole number." ; continue ;;
+        esac
+        if [ "$val" -lt "$lo" ] || [ "$val" -gt "$hi" ]; then
+            warn "Out of range — expected ${lo}..${hi}."
+            continue
+        fi
+        printf -v "$__var" '%s' "$val"
+        return
+    done
+}
+
+ask_tun_custom() {
+    echo ""
+    echo -e "  ${BOLD}Custom TUN values${NC}  ${DIM}(each one is explained; press Enter to accept)${NC}"
+    echo ""
+
+    echo -e "  ${DIM}MTU — bytes per packet on the tunnel. Higher means fewer packets for${NC}"
+    echo -e "  ${DIM}the same data, but anything above the real path MTU fragments, which${NC}"
+    echo -e "  ${DIM}costs far more than it saves. 1400-1460 is the safe band.${NC}"
+    ask_num_range TUN_MTU "  mtu            (bytes)" "1420" 576 9000
+    echo ""
+
+    echo -e "  ${DIM}sock_buf — pcap capture/inject buffer. Absorbs inbound bursts; this${NC}"
+    echo -e "  ${DIM}memory is reserved whether it is used or not, so keep it modest on a${NC}"
+    echo -e "  ${DIM}small VPS. 2097152 = 2MB, 4194304 = 4MB, 16777216 = 16MB.${NC}"
+    ask_num_range TUN_SOCK_BUF "  sock_buf       (bytes)" "4194304" 262144 67108864
+    echo ""
+
+    echo -e "  ${DIM}rx_queue — inbound frames buffered between the packet reader and the${NC}"
+    echo -e "  ${DIM}tunnel. The only place INBOUND delay can build up, so deeper survives${NC}"
+    echo -e "  ${DIM}bigger bursts but raises worst-case latency.${NC}"
+    ask_num_range TUN_RX_QUEUE "  rx_queue       (frames)" "512" 64 8192
+    echo ""
+
+    echo -e "  ${BOLD}txqueuelen${NC} ${DIM}— kernel queue on the TUN device. There is no userspace${NC}"
+    echo -e "  ${DIM}send queue any more, so THIS is the outbound buffer and the main${NC}"
+    echo -e "  ${DIM}latency/throughput dial: short keeps ping flat under load, long${NC}"
+    echo -e "  ${DIM}tolerates burstier senders. gaming=100, stable=500, speed=2000.${NC}"
+    ask_num_range TUN_TXQUEUELEN "  txqueuelen     (packets)" "500" 10 10000
+
+    local ms=$(( TUN_TXQUEUELEN * TUN_MTU * 8 / 50000 ))
+    echo ""
+    if [ "$ms" -gt 250 ]; then
+        warn "A full outbound queue is ~${ms} ms on a saturated 50Mbit link (high ping under load)."
+    else
+        info "A full outbound queue is ~${ms} ms on a saturated 50Mbit link."
+    fi
+}
+
+ask_tun_profile() {
+    echo ""
+    echo -e "  ${BOLD}TUN Performance Profile:${NC}"
+    echo "    1)  auto    — Sizes buffers from this machine's RAM (recommended)"
+    echo "    2)  stable  — Balanced: low, steady ping with good bandwidth"
+    echo "    3)  speed   — Maximum throughput; deeper buffers, higher ping under load"
+    echo "    4)  gaming  — Shortest queues: lowest and flattest ping, less bandwidth"
+    echo "    5)  custom  — Set every value yourself"
+    echo ""
+    echo -e "  ${DIM}What changes: pcap buffer, MTU, inbound queue, and the kernel${NC}"
+    echo -e "  ${DIM}txqueuelen on the TUN device (the main latency/throughput dial).${NC}"
+    echo ""
+    ask TUN_PROF_CHOICE "TUN Profile" "1"
+    TUN_MTU=""; TUN_SOCK_BUF=""; TUN_RX_QUEUE=""; TUN_TXQUEUELEN=""
+    case "$TUN_PROF_CHOICE" in
+        1|auto)   TUN_TUNE_PROFILE="auto"   ;;
+        2|stable) TUN_TUNE_PROFILE="stable" ;;
+        3|speed)  TUN_TUNE_PROFILE="speed"  ;;
+        4|gaming) TUN_TUNE_PROFILE="gaming" ;;
+        5|custom) TUN_TUNE_PROFILE="custom"; ask_tun_custom ;;
+        *)        TUN_TUNE_PROFILE="auto"   ;;
+    esac
+
+    echo ""
+    echo -e "  ${BOLD}Encrypt tunnel payload (AES-GCM):${NC}"
+    echo -e "  ${DIM}ON  = each packet is sealed. Costs ~0.6us/packet, i.e. a ceiling${NC}"
+    echo -e "  ${DIM}      around 7 Gbit/s on one core -- not what limits a real link.${NC}"
+    echo -e "  ${DIM}OFF = fastest possible, but the tunnel carries plaintext IP:${NC}"
+    echo -e "  ${DIM}      anyone on the path can read and modify it, and DPI can${NC}"
+    echo -e "  ${DIM}      classify it directly. Only for a trusted path.${NC}"
+    echo ""
+    ask TUN_ENC_CHOICE "Enable encryption (y/n)" "y"
+    case "$TUN_ENC_CHOICE" in
+        n|N|no|NO) TUN_ENCRYPT="false" ;;
+        *)         TUN_ENCRYPT="true"  ;;
+    esac
+
+    echo ""
+    if [ "$TUN_ENCRYPT" = "true" ]; then
+        info "TUN Profile : ${TUN_TUNE_PROFILE}  |  encryption: on"
+    else
+        warn "TUN Profile : ${TUN_TUNE_PROFILE}  |  encryption: OFF - traffic is readable on the path"
+    fi
+    warn "Use the SAME profile and encryption setting on BOTH ends."
+}
+
+ask_advanced() {
+    if [ "$TRANSPORT" = "tun" ]; then
+        ADV_AUTO_TUNE="true"
+        apply_profile "stable"
+        info "Tuner Mode : not applicable to tun — TUN is tuned by its own profile above."
+        return
+    fi
+    echo ""
+    echo -e "  ${BOLD}Tuner Mode:${NC}"
+    echo "    1)  auto         — Adaptive auto-tuner (recommended)"
+    echo "    2)  stable       — Balanced, reliable for most setups"
+    echo "    3)  aggressive   — Max throughput, high memory usage"
+    echo "    4)  low_latency  — Minimum delay, small buffers"
+    echo "    5)  low_hardware — Weak VPS / low RAM"
+    echo "    6)  custom       — Set every value manually"
+    echo ""
+    ask ADV_CHOICE "Tuner Mode" "1"
+    echo ""
+    case "$ADV_CHOICE" in
+        1|auto)
+            ADV_AUTO_TUNE="true"
+            apply_profile "stable"
+            ;;
+        2|stable)
+            ADV_AUTO_TUNE="false"
+            apply_profile "stable"
+            ;;
+        3|aggressive)
+            ADV_AUTO_TUNE="false"
+            apply_profile "aggressive"
+            ;;
+        4|low_latency)
+            ADV_AUTO_TUNE="false"
+            apply_profile "low_latency"
+            ;;
+        5|low_hardware)
+            ADV_AUTO_TUNE="false"
+            apply_profile "low_hardware"
+            ;;
+        6|custom)
+            ADV_AUTO_TUNE="false"
+            ADV_PROFILE="custom"
+            echo -e "  ${BOLD}Timeouts & Intervals:${NC}"
+            ask ADV_TCP_KEEPALIVE    "tcp_keepalive       (sec)"    "1"
+            ask ADV_CONN_TIMEOUT     "connection_timeout  (sec)"    "30"
+            ask ADV_SESSION_TIMEOUT  "session_timeout     (sec)"    "60"
+            ask ADV_CLEANUP_INTERVAL "cleanup_interval    (sec)"    "3"
+            echo ""
+            echo -e "  ${BOLD}Heartbeat  (in-band session keepalive, all transports except tun):${NC}"
+            echo -e "  ${DIM}Ping every keepalive_sec; tunnel is declared dead only after${NC}"
+            echo -e "  ${DIM}dead_timeout_sec with zero inbound frames. Keep dead_timeout_sec${NC}"
+            echo -e "  ${DIM}at least ~3x keepalive_sec so lost pings don't cause a false drop.${NC}"
+            ask ADV_KEEPALIVE_SEC    "keepalive_sec       (sec)"    "15"
+            ask ADV_DEAD_TIMEOUT_SEC "dead_timeout_sec    (sec)"    "60"
+            echo ""
+            echo -e "  ${BOLD}Buffers  (bytes, e.g. 4194304 = 4MB):${NC}"
+            ask ADV_TCP_READ_BUF     "tcp_read_buffer     (bytes)"  "4194304"
+            ask ADV_TCP_WRITE_BUF    "tcp_write_buffer    (bytes)"  "4194304"
+            ask ADV_UDP_BUF          "udp_buffer_size     (bytes)"  "4194304"
+            echo ""
+            echo -e "  ${BOLD}Channel / Stream sizes:${NC}"
+            ask ADV_CHANNEL_BACKLOG  "channel_backlog     (count)"  "4096"
+            ask ADV_STREAM_CHAN_BUF  "stream_chan_buf     (count)"  "512"
+            ;;
+        *)
+            ADV_AUTO_TUNE="true"
+            apply_profile "stable"
+            ;;
+    esac
+    info "Tuner Profile : ${ADV_PROFILE}$([ "$ADV_AUTO_TUNE" = "true" ] && echo " (adaptive)" || echo " (fixed)")"
+}
+
+build_advanced_json() {
+    printf '  "advanced": {
+'
+    printf '    "auto_tune": %s,
+'          "$ADV_AUTO_TUNE"
+    printf '    "tcp_nodelay": true,
+'
+    printf '    "tcp_keepalive": %s,
+'      "$ADV_TCP_KEEPALIVE"
+    printf '    "connection_timeout": %s,
+' "$ADV_CONN_TIMEOUT"
+    printf '    "session_timeout": %s,
+'    "$ADV_SESSION_TIMEOUT"
+    printf '    "cleanup_interval": %s,
+'   "$ADV_CLEANUP_INTERVAL"
+    printf '    "tcp_read_buffer": %s,
+'    "$ADV_TCP_READ_BUF"
+    printf '    "tcp_write_buffer": %s,
+'   "$ADV_TCP_WRITE_BUF"
+    printf '    "udp_buffer_size": %s,
+'    "$ADV_UDP_BUF"
+    printf '    "channel_backlog": %s,
+'    "$ADV_CHANNEL_BACKLOG"
+    printf '    "stream_chan_buf": %s,
+'      "$ADV_STREAM_CHAN_BUF"
+    printf '    "keepalive_sec": %s,
+'      "$ADV_KEEPALIVE_SEC"
+    printf '    "dead_timeout_sec": %s
+'   "$ADV_DEAD_TIMEOUT_SEC"
+    printf '  }'
+}
+
+build_socks5_json() {
+    printf '  "socks5": {
+    "enabled": %s,
+    "bind": "%s"
+  },
+' "$SOCKS5_ENABLED" "$SOCKS5_BIND"
+}
+
+build_socks5_yaml() {
+    printf "socks5:
+  enabled: %s
+  bind: \"%s\"
+
+" "$SOCKS5_ENABLED" "$SOCKS5_BIND"
+}
+
+build_advanced_yaml() {
+    printf "advanced:
+"
+    printf "  auto_tune: %s
+"          "$ADV_AUTO_TUNE"
+    printf "  tcp_nodelay: true
+"
+    printf "  tcp_keepalive: %s
+"      "$ADV_TCP_KEEPALIVE"
+    printf "  connection_timeout: %s
+" "$ADV_CONN_TIMEOUT"
+    printf "  session_timeout: %s
+"    "$ADV_SESSION_TIMEOUT"
+    printf "  cleanup_interval: %s
+"   "$ADV_CLEANUP_INTERVAL"
+    printf "  tcp_read_buffer: %s
+"    "$ADV_TCP_READ_BUF"
+    printf "  tcp_write_buffer: %s
+"   "$ADV_TCP_WRITE_BUF"
+    printf "  udp_buffer_size: %s
+"    "$ADV_UDP_BUF"
+    printf "  channel_backlog: %s
+"    "$ADV_CHANNEL_BACKLOG"
+    printf "  stream_chan_buf: %s
+"     "$ADV_STREAM_CHAN_BUF"
+    printf "  keepalive_sec: %s
+"     "$ADV_KEEPALIVE_SEC"
+    printf "  dead_timeout_sec: %s
+"  "$ADV_DEAD_TIMEOUT_SEC"
+}
+
+dc_applies() {
+    case "$TRANSPORT" in
+        quantum|tun) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+build_dc_json() {
+    dc_applies || return 0
+    [ "$DC_PROFILE" = "auto" ] && return 0
+    printf '  "dc": {
+    "streams_per_carrier": %s,
+    "max_carriers": %s,
+    "carrier_lifetime_secs": %s
+  },
+' "$DC_STREAMS" "$DC_CARRIERS" "$DC_LIFETIME"
+}
+
+build_dc_yaml() {
+    dc_applies || return 0
+    [ "$DC_PROFILE" = "auto" ] && return 0
+    printf 'dc:
+  streams_per_carrier: %s
+  max_carriers: %s
+  carrier_lifetime_secs: %s
+
+' "$DC_STREAMS" "$DC_CARRIERS" "$DC_LIFETIME"
+}
+
+ask_dc() {
+    DC_PROFILE="auto"; DC_STREAMS=8; DC_CARRIERS=32; DC_LIFETIME=1500
+
+    if ! dc_applies; then
+        info "DC core : not used by ${TRANSPORT}"
+        return
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}DC core — how many connections share one carrier${NC}"
+    echo -e "  ${DIM}A lost packet stalls everyone sharing that carrier until it is resent.${NC}"
+    echo -e "  ${DIM}Fewer per carrier = better isolation, more connections to the network.${NC}"
+    echo ""
+    echo "    1) Balanced   — 8 per carrier   (recommended)"
+    echo "    2) Stability  — 4 per carrier   (lossy or heavily filtered path)"
+    echo "    3) Speed      — 16 per carrier  (clean path, fewer connections)"
+    echo "    4) Custom"
+    echo ""
+    while true; do
+        ask DC_CHOICE "Profile" "1"
+        case "$DC_CHOICE" in
+            1|balanced|auto)
+                DC_PROFILE="auto"
+                info "DC core : balanced (8 per carrier, up to 32 carriers)"
+                break ;;
+            2|stability|stable)
+                DC_PROFILE="stable"; DC_STREAMS=4; DC_CARRIERS=32; DC_LIFETIME=900
+                info "DC core : stability (4 per carrier, up to 32 carriers, renewed every 15m)"
+                break ;;
+            3|speed|fast)
+                DC_PROFILE="speed"; DC_STREAMS=16; DC_CARRIERS=16; DC_LIFETIME=1800
+                info "DC core : speed (16 per carrier, up to 16 carriers)"
+                break ;;
+            4|custom)
+                DC_PROFILE="custom"
+                ask_num_range DC_STREAMS "Connections per carrier" 8 1 64
+                ask_num_range DC_CARRIERS "Maximum carriers" 32 2 64
+                ask_num_range DC_LIFETIME "Renew a carrier after (seconds, 0 = never)" 1500 0 86400
+                [ "$DC_LIFETIME" = "0" ] && DC_LIFETIME=-1
+                info "DC core : custom (${DC_STREAMS} per carrier, up to ${DC_CARRIERS} carriers)"
+                break ;;
+            *) warn "Please enter 1-4." ;;
+        esac
+    done
+}
+
+write_server_config_tcp() {
+    local port="$1" psk="$2"
+    shift 2
+    local ports_json ports_yaml
+    ports_json=$(build_ports_json "$@")
+    ports_yaml=$(build_ports_yaml "$@")
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "server",
+  "transport": "tcp",
+  "psk": "%s",
+  "log_level": "info",
+  "listeners": [
+    {
+      "addr": "0.0.0.0:%s",
+      "transport": "tcp",
+      "maps": [
+%s
+      ]
+    }
+  ],
+' "$psk" "$port" "$ports_json"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: server
+transport: tcp
+psk: "%s"
+log_level: info
+listeners:
+  - addr: "0.0.0.0:%s"
+    transport: tcp
+    maps:
+%s
+' "$psk" "$port" "$ports_yaml"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_client_config_tcp() {
+    local server_ip="$1" server_port="$2" psk="$3"
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "client",
+  "transport": "tcp",
+  "psk": "%s",
+  "log_level": "info",
+  "paths": [
+    {
+      "transport": "tcp",
+      "addr": "%s:%s",
+      "connection_pool": %s,
+      "retry_interval": 3,
+      "dial_timeout": 10
+    }
+  ],
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: client
+transport: tcp
+psk: "%s"
+log_level: info
+paths:
+  - transport: tcp
+    addr: "%s:%s"
+    connection_pool: %s
+    retry_interval: 3
+    dial_timeout: 10
+
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_server_config_ws() {
+    local port="$1" psk="$2" ws_path="$3"
+    shift 3
+    local ports_json ports_yaml
+    ports_json=$(build_ports_json "$@")
+    ports_yaml=$(build_ports_yaml "$@")
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "server",
+  "transport": "ws",
+  "psk": "%s",
+  "log_level": "info",
+  "listeners": [
+    {
+      "addr": "0.0.0.0:%s",
+      "transport": "ws",
+      "maps": [
+%s
+      ]
+    }
+  ],
+  "ws_settings": {
+    "path": "%s"
+  },
+' "$psk" "$port" "$ports_json" "$ws_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: server
+transport: ws
+psk: "%s"
+log_level: info
+listeners:
+  - addr: "0.0.0.0:%s"
+    transport: ws
+    maps:
+%s
+ws_settings:
+  path: "%s"
+
+' "$psk" "$port" "$ports_yaml" "$ws_path"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_client_config_ws() {
+    local server_ip="$1" server_port="$2" psk="$3" ws_path="$4"
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "client",
+  "transport": "ws",
+  "psk": "%s",
+  "log_level": "info",
+  "paths": [
+    {
+      "transport": "ws",
+      "addr": "%s:%s",
+      "connection_pool": %s,
+      "retry_interval": 3,
+      "dial_timeout": 10
+    }
+  ],
+  "ws_settings": {
+    "path": "%s"
+  },
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: client
+transport: ws
+psk: "%s"
+log_level: info
+paths:
+  - transport: ws
+    addr: "%s:%s"
+    connection_pool: %s
+    retry_interval: 3
+    dial_timeout: 10
+
+ws_settings:
+  path: "%s"
+
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_server_config_wss() {
+    local port="$1" psk="$2" ws_path="$3" cert="$4" key="$5"
+    shift 5
+    local ports_json ports_yaml
+    ports_json=$(build_ports_json "$@")
+    ports_yaml=$(build_ports_yaml "$@")
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "server",
+  "transport": "wss",
+  "psk": "%s",
+  "log_level": "info",
+  "listeners": [
+    {
+      "addr": "0.0.0.0:%s",
+      "transport": "wss",
+      "cert_file": "%s",
+      "key_file": "%s",
+      "maps": [
+%s
+      ]
+    }
+  ],
+  "ws_settings": {
+    "path": "%s"
+  },
+' "$psk" "$port" "$cert" "$key" "$ports_json" "$ws_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: server
+transport: wss
+psk: "%s"
+log_level: info
+listeners:
+  - addr: "0.0.0.0:%s"
+    transport: wss
+    cert_file: "%s"
+    key_file: "%s"
+    maps:
+%s
+ws_settings:
+  path: "%s"
+
+' "$psk" "$port" "$cert" "$key" "$ports_yaml" "$ws_path"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_client_config_wss() {
+    local server_ip="$1" server_port="$2" psk="$3" ws_path="$4"
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "client",
+  "transport": "wss",
+  "psk": "%s",
+  "log_level": "info",
+  "paths": [
+    {
+      "transport": "wss",
+      "addr": "%s:%s",
+      "connection_pool": %s,
+      "retry_interval": 3,
+      "dial_timeout": 10
+    }
+  ],
+  "ws_settings": {
+    "path": "%s"
+  },
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: client
+transport: wss
+psk: "%s"
+log_level: info
+paths:
+  - transport: wss
+    addr: "%s:%s"
+    connection_pool: %s
+    retry_interval: 3
+    dial_timeout: 10
+
+ws_settings:
+  path: "%s"
+
+
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_server_config_http() {
+    local port="$1" psk="$2" http_domain="$3" http_path="$4"
+    shift 4
+    local ports_json ports_yaml
+    ports_json=$(build_ports_json "$@")
+    ports_yaml=$(build_ports_yaml "$@")
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "server",
+  "transport": "http",
+  "psk": "%s",
+  "log_level": "info",
+  "listeners": [
+    {
+      "addr": "0.0.0.0:%s",
+      "transport": "http",
+      "maps": [
+%s
+      ]
+    }
+  ],
+  "http_settings": {
+    "fake_domain": "%s",
+    "path": "%s"
+  },
+' "$psk" "$port" "$ports_json" "$http_domain" "$http_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: server
+transport: http
+psk: "%s"
+log_level: info
+listeners:
+  - addr: "0.0.0.0:%s"
+    transport: http
+    maps:
+%s
+http_settings:
+  fake_domain: "%s"
+  path: "%s"
+
+' "$psk" "$port" "$ports_yaml" "$http_domain" "$http_path"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_server_config_xhttp() {
+    local port="$1" psk="$2" path="$3" secure="$4" cert="$5" key="$6"
+    local cdn="$7" cdn_host="$8" cdn_port="$9" cdn_ips="${10}" insecure="${11}"
+    local pool="${12}" peer_ip="${13}"
+    shift 13
+    local ports_json ports_yaml transport edge_json edge_yaml peer_json peer_yaml
+    local cert_json cert_yaml
+
+    ports_json=$(build_ports_json "$@")
+    ports_yaml=$(build_ports_yaml "$@")
+    edge_json=$(build_edge_ips_json "$cdn_ips")
+    edge_yaml=$(build_edge_ips_yaml "$cdn_ips")
+    peer_json=$(build_edge_ips_json "$peer_ip")
+    peer_yaml=$(build_edge_ips_yaml "$peer_ip")
+
+    transport="xhttp"
+    [ "$secure" = "true" ] && transport="xhttps"
+    [ -z "$pool" ] && pool=4
+
+    cert_json=""
+    cert_yaml=""
+    if [ "$cdn" != "true" ] && [ "$secure" = "true" ]; then
+        cert_json=$(printf '\n  "cert_file": "%s",\n  "key_file": "%s",' "$cert" "$key")
+        cert_yaml=$(printf '\ncert_file: "%s"\nkey_file: "%s"' "$cert" "$key")
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {
+        if [ "$cdn" = "true" ]; then
+            printf '{
+  "mode": "server",
+  "transport": "%s",
+  "psk": "%s",
+  "log_level": "info",
+  "listeners": [
+    {
+      "addr": "0.0.0.0:%s",
+      "connection_pool": %s,
+      "peer_ips": [%s],
+      "maps": [
+%s
+      ]
+    }
+  ],
+  "xhttp": {
+    "path": "%s",
+    "mode": "auto",
+    "allow_insecure_tls": %s,
+    "cdn": {
+      "enabled": true,
+      "host": "%s",
+      "port": %s,
+      "edge_ips": [%s]
+    }
+  },
+' "$transport" "$psk" "$port" "$pool" "$peer_json" "$ports_json" \
+  "$path" "$insecure" "$cdn_host" "$cdn_port" "$edge_json"
+        else
+            printf '{
+  "mode": "server",
+  "transport": "%s",
+  "psk": "%s",
+  "log_level": "info",%s
+  "listeners": [
+    {
+      "addr": "0.0.0.0:%s",
+      "maps": [
+%s
+      ]
+    }
+  ],
+  "xhttp": {
+    "path": "%s",
+    "mode": "auto"
+  },
+' "$transport" "$psk" "$cert_json" "$port" "$ports_json" "$path"
+        fi
+        build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {
+        if [ "$cdn" = "true" ]; then
+            printf 'mode: server
+transport: %s
+psk: "%s"
+log_level: info
+listeners:
+  - addr: "0.0.0.0:%s"
+    connection_pool: %s
+    peer_ips: %s
+    maps:
+%s
+xhttp:
+  path: "%s"
+  mode: auto
+  allow_insecure_tls: %s
+  cdn:
+    enabled: true
+    host: "%s"
+    port: %s
+    edge_ips: %s
+
+' "$transport" "$psk" "$port" "$pool" "$peer_yaml" "$ports_yaml" \
+  "$path" "$insecure" "$cdn_host" "$cdn_port" "$edge_yaml"
+        else
+            printf 'mode: server
+transport: %s
+psk: "%s"
+log_level: info%s
+listeners:
+  - addr: "0.0.0.0:%s"
+    maps:
+%s
+xhttp:
+  path: "%s"
+  mode: auto
+
+' "$transport" "$psk" "$cert_yaml" "$port" "$ports_yaml" "$path"
+        fi
+        build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_client_config_xhttp() {
+    local server_ip="$1" server_port="$2" psk="$3" path="$4" mode="$5" secure="$6"
+    local insecure="$7" cdn="$8" cdn_host="$9" cdn_port="${10}" cdn_ips="${11}"
+    local origin_port="${12}" cert="${13}" key="${14}" public_ip="${15}"
+    local transport addr peer_json peer_yaml cert_json cert_yaml
+
+    transport="xhttp"
+    [ "$secure" = "true" ] && transport="xhttps"
+
+    addr="${server_ip}:${server_port}"
+    peer_json=$(build_edge_ips_json "$(echo "$server_ip" | xargs)")
+    peer_yaml=$(build_edge_ips_yaml "$(echo "$server_ip" | xargs)")
+
+    cert_json=""
+    cert_yaml=""
+    if [ "$cdn" = "true" ] && [ -n "$cert" ] && [ -n "$key" ]; then
+        cert_json=$(printf '\n  "cert_file": "%s",\n  "key_file": "%s",' "$cert" "$key")
+        cert_yaml=$(printf '\ncert_file: "%s"\nkey_file: "%s"' "$cert" "$key")
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {
+        if [ "$cdn" = "true" ]; then
+            printf '{
+  "mode": "client",
+  "transport": "%s",
+  "psk": "%s",
+  "log_level": "info",%s
+  "paths": [
+    {
+      "addr": "%s",
+      "peer_ips": [%s],
+      "public_ip": "%s",
+      "retry_interval": 3,
+      "dial_timeout": 10
+    }
+  ],
+  "xhttp": {
+    "path": "%s",
+    "mode": "%s",
+    "cdn": {
+      "enabled": true,
+      "origin_bind": "0.0.0.0:%s"
+    }
+  },
+' "$transport" "$psk" "$cert_json" "$addr" "$peer_json" "$public_ip" \
+  "$path" "$mode" "$origin_port"
+        else
+            printf '{
+  "mode": "client",
+  "transport": "%s",
+  "psk": "%s",
+  "log_level": "info",
+  "paths": [
+    {
+      "addr": "%s",
+      "connection_pool": %s,
+      "retry_interval": 3,
+      "dial_timeout": 10
+    }
+  ],
+  "xhttp": {
+    "path": "%s",
+    "mode": "%s",
+    "allow_insecure_tls": %s
+  },
+' "$transport" "$psk" "$addr" "$CLIENT_CONN_POOL" "$path" "$mode" "$insecure"
+        fi
+        build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {
+        if [ "$cdn" = "true" ]; then
+            printf 'mode: client
+transport: %s
+psk: "%s"
+log_level: info%s
+paths:
+  - addr: "%s"
+    peer_ips: %s
+    public_ip: "%s"
+    retry_interval: 3
+    dial_timeout: 10
+
+xhttp:
+  path: "%s"
+  mode: "%s"
+  cdn:
+    enabled: true
+    origin_bind: "0.0.0.0:%s"
+
+' "$transport" "$psk" "$cert_yaml" "$addr" "$peer_yaml" "$public_ip" \
+  "$path" "$mode" "$origin_port"
+        else
+            printf 'mode: client
+transport: %s
+psk: "%s"
+log_level: info
+paths:
+  - addr: "%s"
+    connection_pool: %s
+    retry_interval: 3
+    dial_timeout: 10
+
+xhttp:
+  path: "%s"
+  mode: "%s"
+  allow_insecure_tls: %s
+
+' "$transport" "$psk" "$addr" "$CLIENT_CONN_POOL" "$path" "$mode" "$insecure"
+        fi
+        build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_server_config_https() {
+    local port="$1" psk="$2" http_domain="$3" http_path="$4" cert="$5" key="$6"
+    shift 6
+    local ports_json ports_yaml
+    ports_json=$(build_ports_json "$@")
+    ports_yaml=$(build_ports_yaml "$@")
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "server",
+  "transport": "https",
+  "psk": "%s",
+  "log_level": "info",
+  "listeners": [
+    {
+      "addr": "0.0.0.0:%s",
+      "transport": "https",
+      "cert_file": "%s",
+      "key_file": "%s",
+      "maps": [
+%s
+      ]
+    }
+  ],
+  "http_settings": {
+    "fake_domain": "%s",
+    "path": "%s"
+  },
+' "$psk" "$port" "$cert" "$key" "$ports_json" "$http_domain" "$http_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: server
+transport: https
+psk: "%s"
+log_level: info
+listeners:
+  - addr: "0.0.0.0:%s"
+    transport: https
+    cert_file: "%s"
+    key_file: "%s"
+    maps:
+%s
+http_settings:
+  fake_domain: "%s"
+  path: "%s"
+
+' "$psk" "$port" "$cert" "$key" "$ports_yaml" "$http_domain" "$http_path"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_client_config_https() {
+    local server_ip="$1" server_port="$2" psk="$3" http_domain="$4" http_path="$5"
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "client",
+  "transport": "https",
+  "psk": "%s",
+  "log_level": "info",
+  "paths": [
+    {
+      "transport": "https",
+      "addr": "%s:%s",
+      "connection_pool": %s,
+      "retry_interval": 3,
+      "dial_timeout": 10
+    }
+  ],
+  "http_settings": {
+    "fake_domain": "%s",
+    "path": "%s"
+  },
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: client
+transport: https
+psk: "%s"
+log_level: info
+paths:
+  - transport: https
+    addr: "%s:%s"
+    connection_pool: %s
+    retry_interval: 3
+    dial_timeout: 10
+
+http_settings:
+  fake_domain: "%s"
+  path: "%s"
+
+
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_server_config_quantum() {
+    local port="$1" psk="$2" mtu="$3" block="$4"
+    shift 4
+    local ports_json ports_yaml
+    ports_json=$(build_ports_json "$@")
+    ports_yaml=$(build_ports_yaml "$@")
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "server",
+  "transport": "quantum",
+  "psk": "%s",
+  "log_level": "info",
+  "listeners": [
+    {
+      "addr": "0.0.0.0:%s",
+      "transport": "quantum",
+      "maps": [
+%s
+      ]
+    }
+  ],
+  "quantum": {
+    "mtu": %s,
+    "block": "%s"
+  },
+' "$psk" "$port" "$ports_json" "$mtu" "$block"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: server
+transport: quantum
+psk: "%s"
+log_level: info
+listeners:
+  - addr: "0.0.0.0:%s"
+    transport: quantum
+    maps:
+%s
+quantum:
+  mtu: %s
+  block: "%s"
+
+' "$psk" "$port" "$ports_yaml" "$mtu" "$block"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_client_config_quantum() {
+    local server_ip="$1" server_port="$2" psk="$3" mtu="$4" block="$5"
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "client",
+  "transport": "quantum",
+  "psk": "%s",
+  "log_level": "info",
+  "paths": [
+    {
+      "transport": "quantum",
+      "addr": "%s:%s",
+      "connection_pool": %s,
+      "retry_interval": 3,
+      "dial_timeout": 10
+    }
+  ],
+  "quantum": {
+    "mtu": %s,
+    "block": "%s"
+  },
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$mtu" "$block"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: client
+transport: quantum
+psk: "%s"
+log_level: info
+paths:
+  - transport: quantum
+    addr: "%s:%s"
+    connection_pool: %s
+    retry_interval: 3
+    dial_timeout: 10
+
+quantum:
+  mtu: %s
+  block: "%s"
+
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$mtu" "$block"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_server_config_quantumplus() {
+    local port="$1" psk="$2"
+    shift 2
+    local ports_json ports_yaml
+    ports_json=$(build_ports_json "$@")
+    ports_yaml=$(build_ports_yaml "$@")
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "server",
+  "transport": "quantum+",
+  "psk": "%s",
+  "log_level": "info",
+  "listeners": [
+    {
+      "addr": "0.0.0.0:%s",
+      "transport": "quantum+",
+      "maps": [
+%s
+      ]
+    }
+  ],
+' "$psk" "$port" "$ports_json"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: server
+transport: "quantum+"
+psk: "%s"
+log_level: info
+listeners:
+  - addr: "0.0.0.0:%s"
+    transport: "quantum+"
+    maps:
+%s
+' "$psk" "$port" "$ports_yaml"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_client_config_quantumplus() {
+    local server_ip="$1" server_port="$2" psk="$3"
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "client",
+  "transport": "quantum+",
+  "psk": "%s",
+  "log_level": "info",
+  "paths": [
+    {
+      "transport": "quantum+",
+      "addr": "%s:%s",
+      "connection_pool": %s,
+      "retry_interval": 3,
+      "dial_timeout": 10
+    }
+  ],
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: client
+transport: "quantum+"
+psk: "%s"
+log_level: info
+paths:
+  - transport: "quantum+"
+    addr: "%s:%s"
+    connection_pool: %s
+    retry_interval: 3
+    dial_timeout: 10
+
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_client_config_http() {
+    local server_ip="$1" server_port="$2" psk="$3" http_domain="$4" http_path="$5"
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {         printf '{
+  "mode": "client",
+  "transport": "http",
+  "psk": "%s",
+  "log_level": "info",
+  "paths": [
+    {
+      "transport": "http",
+      "addr": "%s:%s",
+      "connection_pool": %s,
+      "retry_interval": 3,
+      "dial_timeout": 10
+    }
+  ],
+  "http_settings": {
+    "fake_domain": "%s",
+    "path": "%s"
+  },
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+    else
+        {         printf 'mode: client
+transport: http
+psk: "%s"
+log_level: info
+paths:
+  - transport: http
+    addr: "%s:%s"
+    connection_pool: %s
+    retry_interval: 3
+    dial_timeout: 10
+
+http_settings:
+  fake_domain: "%s"
+  path: "%s"
+
+' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+    fi
+}
+
+write_server_config_tun() {
+    local port="$1" psk="$2" listen_ip="$3" dst_ip="$4" local_addr="$5" remote_addr="$6"
+    local encap="$7" profile="$8" iface="$9" spoof_src="${10}" spoof_dst="${11}" dcpi="${12}" tun_name="${13}"
+    local heartbeat_sec="${14}" idle_timeout_sec="${15}"
+    shift 15
+    local ports_json ports_yaml
+    ports_json=$(build_ports_json "$@")
+    ports_yaml=$(build_ports_yaml "$@")
+    [ -z "$tun_name" ] && tun_name="dagger0"
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {
+            printf '{
+'
+            printf '  "mode": "server",
+'
+            printf '  "transport": "tun",
+'
+            printf '  "psk": "%s",
+'       "$psk"
+            printf '  "log_level": "info",
+'
+            printf '  "listeners": [
+'
+            printf '    {
+'
+            printf '      "addr": "0.0.0.0:%s",\n' "$port"
+            printf '      "transport": "tun",
+'
+            printf '      "maps": [
+'
+            printf '%s
+'                   "$ports_json"
+            printf '      ]
+'
+            printf '    }
+'
+            printf '  ],
+'
+            printf '  "tun": {
+'
+            printf '    "encapsulation": "%s",
+' "$encap"
+            printf '    "name": "%s",
+'           "$tun_name"
+            printf '    "local_addr": "%s",
+'     "$local_addr"
+            printf '    "remote_addr": "%s",
+'    "$remote_addr"
+            printf '    "profile": "%s",
+' "$TUN_TUNE_PROFILE"
+            printf '    "encrypt": %s,
+' "$TUN_ENCRYPT"
+            [ -n "$TUN_MTU"        ] && printf '    "mtu": %s,
+' "$TUN_MTU"
+            [ -n "$TUN_RX_QUEUE"   ] && printf '    "rx_queue": %s,
+' "$TUN_RX_QUEUE"
+            [ -n "$TUN_TXQUEUELEN" ] && printf '    "tx_queue_len": %s,
+' "$TUN_TXQUEUELEN"
+            printf '    "heartbeat_sec": %s,
+' "$heartbeat_sec"
+            printf '    "idle_timeout_sec": %s
+' "$idle_timeout_sec"
+            printf '  },
+'
+            printf '  "ipx": {
+'
+            printf '    "mode": "server",
+'
+            printf '    "profile": "%s",
+'        "$profile"
+            { [ "$profile" = "tcp" ] || [ "$profile" = "udp" ]; } && [ -n "$TUN_L4_PORT" ] && printf '    "l4_port": %s,
+' "$TUN_L4_PORT"
+            printf '    "listen_ip": "%s",
+'      "$listen_ip"
+            printf '    "dst_ip": "%s",
+'         "$dst_ip"
+            [ -n "$iface"     ] && printf '    "interface": "%s",
+'   "$iface"
+            [ "$dcpi" = "yes" ] && printf '    "dcpi_mode": true,
+'
+            [ -n "$spoof_src" ] && printf '    "spoof_src_ip": "%s",
+' "$spoof_src"
+            [ -n "$spoof_dst" ] && printf '    "spoof_dst_ip": "%s",
+' "$spoof_dst"
+            printf '    "sock_buf": %s
+' "${TUN_SOCK_BUF:-0}"
+            printf '  },
+'
+            build_socks5_json
+            build_dc_json
+            build_advanced_json
+            printf '}
+'
+        } > "$CONFIG"
+    else
+        {
+            printf 'mode: server
+'
+            printf 'transport: tun
+'
+            printf 'psk: "%s"
+'        "$psk"
+            printf 'log_level: info
+'
+            printf 'listeners:
+'
+            printf '  - addr: "0.0.0.0:%s"\n' "$port"
+            printf '    transport: tun
+'
+            printf '    maps:
+'
+            printf '%s
+'               "$ports_yaml"
+            printf 'tun:
+'
+            printf '  encapsulation: "%s"
+' "$encap"
+            printf '  name: "%s"
+'          "$tun_name"
+            printf '  local_addr: "%s"
+'    "$local_addr"
+            printf '  remote_addr: "%s"
+'   "$remote_addr"
+            printf '  profile: "%s"
+' "$TUN_TUNE_PROFILE"
+            printf '  encrypt: %s
+' "$TUN_ENCRYPT"
+            [ -n "$TUN_MTU"        ] && printf '  mtu: %s
+' "$TUN_MTU"
+            [ -n "$TUN_RX_QUEUE"   ] && printf '  rx_queue: %s
+' "$TUN_RX_QUEUE"
+            [ -n "$TUN_TXQUEUELEN" ] && printf '  tx_queue_len: %s
+' "$TUN_TXQUEUELEN"
+            printf '  heartbeat_sec: %s
+' "$heartbeat_sec"
+            printf '  idle_timeout_sec: %s
+
+' "$idle_timeout_sec"
+            printf 'ipx:
+'
+            printf '  mode: server
+'
+            printf '  profile: "%s"
+'       "$profile"
+            { [ "$profile" = "tcp" ] || [ "$profile" = "udp" ]; } && [ -n "$TUN_L4_PORT" ] && printf '  l4_port: %s
+' "$TUN_L4_PORT"
+            printf '  listen_ip: "%s"
+'     "$listen_ip"
+            printf '  dst_ip: "%s"
+'        "$dst_ip"
+            [ -n "$iface"     ] && printf '  interface: "%s"
+'   "$iface"
+            [ "$dcpi" = "yes" ] && printf '  dcpi_mode: true
+'
+            [ -n "$spoof_src" ] && printf '  spoof_src_ip: "%s"
+' "$spoof_src"
+            [ -n "$spoof_dst" ] && printf '  spoof_dst_ip: "%s"
+' "$spoof_dst"
+            printf '  sock_buf: %s
+
+' "${TUN_SOCK_BUF:-0}"
+            build_socks5_yaml
+            build_dc_yaml
+            build_advanced_yaml
+        } > "$CONFIG"
+    fi
+}
+
+write_client_config_tun() {
+    local server_port="$1" psk="$2" listen_ip="$3" dst_ip="$4" local_addr="$5" remote_addr="$6"
+    local encap="$7" profile="$8" iface="$9" spoof_src="${10}" spoof_dst="${11}" dcpi="${12}" tun_name="${13}"
+    local heartbeat_sec="${14}" idle_timeout_sec="${15}"
+    [ -z "$tun_name" ] && tun_name="dagger0"
+    mkdir -p "$CONFIG_DIR"
+    if [ "$CONFIG_FMT" = "json" ]; then
+        {
+            printf '{
+'
+            printf '  "mode": "client",
+'
+            printf '  "transport": "tun",
+'
+            printf '  "psk": "%s",
+'        "$psk"
+            printf '  "log_level": "info",
+'
+            printf '  "paths": [
+'
+            printf '    {
+'
+            printf '      "transport": "tun",
+'
+            printf '      "addr": "%s:%s",\n' "$dst_ip" "$server_port"
+
+            printf '      "retry_interval": 3,
+'
+            printf '      "dial_timeout": 30
+'
+            printf '    }
+'
+            printf '  ],
+'
+            printf '  "tun": {
+'
+            printf '    "encapsulation": "%s",
+' "$encap"
+            printf '    "name": "%s",
+'           "$tun_name"
+            printf '    "local_addr": "%s",
+'     "$local_addr"
+            printf '    "remote_addr": "%s",
+'    "$remote_addr"
+            printf '    "profile": "%s",
+' "$TUN_TUNE_PROFILE"
+            printf '    "encrypt": %s,
+' "$TUN_ENCRYPT"
+            [ -n "$TUN_MTU"        ] && printf '    "mtu": %s,
+' "$TUN_MTU"
+            [ -n "$TUN_RX_QUEUE"   ] && printf '    "rx_queue": %s,
+' "$TUN_RX_QUEUE"
+            [ -n "$TUN_TXQUEUELEN" ] && printf '    "tx_queue_len": %s,
+' "$TUN_TXQUEUELEN"
+            printf '    "heartbeat_sec": %s,
+' "$heartbeat_sec"
+            printf '    "idle_timeout_sec": %s
+' "$idle_timeout_sec"
+            printf '  },
+'
+            printf '  "ipx": {
+'
+            printf '    "mode": "client",
+'
+            printf '    "profile": "%s",
+'        "$profile"
+            { [ "$profile" = "tcp" ] || [ "$profile" = "udp" ]; } && [ -n "$TUN_L4_PORT" ] && printf '    "l4_port": %s,
+' "$TUN_L4_PORT"
+            printf '    "listen_ip": "%s",
+'      "$listen_ip"
+            printf '    "dst_ip": "%s",
+'         "$dst_ip"
+            [ -n "$iface"     ] && printf '    "interface": "%s",
+'   "$iface"
+            [ "$dcpi" = "yes" ] && printf '    "dcpi_mode": true,
+'
+            [ -n "$spoof_src" ] && printf '    "spoof_src_ip": "%s",
+' "$spoof_src"
+            [ -n "$spoof_dst" ] && printf '    "spoof_dst_ip": "%s",
+' "$spoof_dst"
+            printf '    "sock_buf": %s
+' "${TUN_SOCK_BUF:-0}"
+            printf '  },
+'
+            build_dc_json
+            build_advanced_json
+            printf '}
+'
+        } > "$CONFIG"
+    else
+        {
+            printf 'mode: client
+'
+            printf 'transport: tun
+'
+            printf 'psk: "%s"
+'         "$psk"
+            printf 'log_level: info
+'
+            printf 'paths:
+'
+            printf '  - transport: tun
+'
+            printf '    addr: "%s:%s"\n' "$dst_ip" "$server_port"
+
+            printf '    retry_interval: 3
+'
+            printf '    dial_timeout: 30
+
+'
+            printf 'tun:
+'
+            printf '  encapsulation: "%s"
+' "$encap"
+            printf '  name: "%s"
+'          "$tun_name"
+            printf '  local_addr: "%s"
+'    "$local_addr"
+            printf '  remote_addr: "%s"
+'   "$remote_addr"
+            printf '  profile: "%s"
+' "$TUN_TUNE_PROFILE"
+            printf '  encrypt: %s
+' "$TUN_ENCRYPT"
+            [ -n "$TUN_MTU"        ] && printf '  mtu: %s
+' "$TUN_MTU"
+            [ -n "$TUN_RX_QUEUE"   ] && printf '  rx_queue: %s
+' "$TUN_RX_QUEUE"
+            [ -n "$TUN_TXQUEUELEN" ] && printf '  tx_queue_len: %s
+' "$TUN_TXQUEUELEN"
+            printf '  heartbeat_sec: %s
+' "$heartbeat_sec"
+            printf '  idle_timeout_sec: %s
+
+' "$idle_timeout_sec"
+            printf 'ipx:
+'
+            printf '  mode: client
+'
+            printf '  profile: "%s"
+'       "$profile"
+            { [ "$profile" = "tcp" ] || [ "$profile" = "udp" ]; } && [ -n "$TUN_L4_PORT" ] && printf '  l4_port: %s
+' "$TUN_L4_PORT"
+            printf '  listen_ip: "%s"
+'     "$listen_ip"
+            printf '  dst_ip: "%s"
+'        "$dst_ip"
+            [ -n "$iface"     ] && printf '  interface: "%s"
+'   "$iface"
+            [ "$dcpi" = "yes" ] && printf '  dcpi_mode: true
+'
+            [ -n "$spoof_src" ] && printf '  spoof_src_ip: "%s"
+' "$spoof_src"
+            [ -n "$spoof_dst" ] && printf '  spoof_dst_ip: "%s"
+' "$spoof_dst"
+            printf '  sock_buf: %s
+
+' "${TUN_SOCK_BUF:-0}"
+            build_dc_yaml
+            build_advanced_yaml
+        } > "$CONFIG"
+    fi
+}
+
+install_service() {
+    local extra_env=""
+    if [ -n "$SERVER_PUBLIC_IP" ]; then
+        extra_env="Environment=DC_SERVER_PUBLIC_IP=${SERVER_PUBLIC_IP}"
+    fi
+    cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=DaggerConnect Tunnel (${SERVICE_NAME})
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=DC_CHANNEL=${CHANNEL:-release}
+Environment=DC_VERSION=${VERSION:-latest}
+${extra_env}
+ExecStart=${LAUNCHER} -c ${CONFIG}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=DaggerConnect
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
+    ok "Service installed: ${SERVICE_NAME}"
+}
+
+start_service() {
+    systemctl restart "$SERVICE_NAME"
+    sleep 2
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        ok "Service is running."
+    else
+        warn "Service failed to start. Logs:"
+        journalctl -u "$SERVICE_NAME" -n 20 --no-pager
+    fi
+}
+
+list_services() {
+    local found=()
+    for cfg in "${CONFIG_DIR}"/*.json "${CONFIG_DIR}"/*.yaml; do
+        [ -f "$cfg" ] || continue
+        local name
+        name=$(basename "$cfg")
+        name="${name%.*}"
+        [ -f "/etc/systemd/system/${name}.service" ] && found+=("${name}.service")
+    done
+    [ ${#found[@]} -eq 0 ] && return 0
+    printf '%s\n' "${found[@]}" | sort -u
+}
+
+install_server() {
+    hr "Install Server"
+    ensure_launcher server
+    check_ptrace_scope
+    tune_network
+    echo ""
+
+    ask_service_name
+    echo ""
+
+    CHANNEL="release"
+    VERSION="latest"
+    info "Version : ${VERSION} (${CHANNEL})"
+    echo ""
+
+    ask_server_public_ip
+    echo ""
+
+    ask_transport
+    echo ""
+
+    if [ "$TRANSPORT" = "tun" ]; then
+        PORT="8443"
+    elif [ "$TRANSPORT" = "xhttp" ] || [ "$TRANSPORT" = "xhttps" ]; then
+        :
+    else
+        ask PORT "Listen port" "8443"
+        echo ""
+    fi
+
+    ask_required PSK "PSK  (must match client)"
+    echo ""
+
+    case "$TRANSPORT" in
+        ws|wss)
+            ask WS_PATH "WebSocket path" "/ws"
+            echo ""
+            ;;
+        http|https)
+            ask HTTP_DOMAIN "Fake domain  (e.g. www.google.com)" "www.google.com"
+            ask HTTP_PATH   "Fake path    (e.g. /search)" "/search"
+            echo ""
+            ;;
+        xhttp|xhttps)
+            ask_xhttp server
+            if [ "$TRANSPORT" = "xhttps" ]; then
+                ask_xhttp_cdn server
+            else
+                XHTTP_CDN="false"; XHTTP_CDN_HOST=""; XHTTP_CDN_PORT="80"
+                XHTTP_CDN_IPS=""; XHTTP_INSECURE="true"; XHTTP_ORIGIN_PORT="8443"
+                XHTTP_PEER_IP=""; XHTTP_PUBLIC_IP=""; XHTTP_CDN_POOL="4"
+            fi
+            if [ "$XHTTP_CDN" = "true" ]; then
+                PORT="$XHTTP_CDN_PORT"
+            else
+                echo ""
+                ask PORT "Listen port" "8443"
+            fi
+            echo ""
+            ;;
+        quantum)
+            echo -e "  ${DIM}Quantum auto-detects the network interface, source IP, and${NC}"
+            echo -e "  ${DIM}gateway MAC at runtime — nothing to configure for those.${NC}"
+            echo ""
+            ask QM_MTU   "MTU" "1350"
+            ask QM_BLOCK "KCP header cipher  (aes/salsa20/none)" "aes"
+            echo ""
+            ;;
+        tun)
+            echo ""
+            echo -e "  ${BOLD}TUN Encapsulation (profile):${NC}"
+            echo "    1)  tcp   — forged TCP segments"
+            echo "    2)  udp   — forged UDP datagrams"
+            echo "    3)  icmp  — ICMP encapsulation"
+            echo "    4)  gre   — GRE   (proto 47)"
+            echo "    5)  ipip  — IP-in-IP (proto 4)"
+            echo "    6)  bip   — BIP/ICMP custom (raw IP_HDRINCL)"
+            echo ""
+            echo -e "  ${DIM}tcp/udp carry ports, so NAT/CGNAT and TCP-only firewalls pass them —${NC}"
+            echo -e "  ${DIM}unlike gre/ipip which restrictive networks drop. Must match the other side.${NC}"
+            echo ""
+            ask TUN_PROFILE_CHOICE "Profile" "1"
+            case "$TUN_PROFILE_CHOICE" in
+                2|udp)  TUN_PROFILE="udp"  ;;
+                3|icmp) TUN_PROFILE="icmp" ;;
+                4|gre)  TUN_PROFILE="gre"  ;;
+                5|ipip) TUN_PROFILE="ipip" ;;
+                6|bip)  TUN_PROFILE="bip"  ;;
+                *)      TUN_PROFILE="tcp"  ;;
+            esac
+            TUN_ENCAP="ipx"
+            TUN_L4_PORT=""
+            if [ "$TUN_PROFILE" = "tcp" ] || [ "$TUN_PROFILE" = "udp" ]; then
+                echo ""
+                echo -e "  ${DIM}Service port = destination port of client→server frames.${NC}"
+                echo -e "  ${DIM}443 looks like HTTPS and clears the most restrictive egress firewalls.${NC}"
+                ask TUN_L4_PORT "L4 service port" "443"
+            fi
+            echo ""
+            info "TUN : profile=${TUN_PROFILE}${TUN_L4_PORT:+  l4_port=${TUN_L4_PORT}}"
+            echo ""
+            _DEFAULT_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+            ask TUN_LOCAL_IP "Server real IP" "${_DEFAULT_IP}"
+            ask_required TUN_PEER_IP "Client real IP"
+            echo ""
+            ask_required TUN_LOCAL_ADDR  "TUN local IP   (server side, any IP, e.g. 10.0.0.1)"
+            ask_required TUN_REMOTE_ADDR "TUN remote IP  (client side, any IP, e.g. 10.0.0.2)"
+            TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
+            TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
+            echo ""
+            ask TUN_IFACE "Network interface  (leave empty for auto-detect)" ""
+            ask TUN_NAME  "TUN device name" "dagger0"
+            echo ""
+            ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec)  -- lower = faster failure detection" "5"
+            ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)  -- how long with no traffic before reconnecting" "60"
+            ask_tun_profile
+            echo ""
+            ask TUN_SPOOF_CHOICE "Enable IP Spoof (y/n)" "n"
+            if [ "$TUN_SPOOF_CHOICE" = "y" ] || [ "$TUN_SPOOF_CHOICE" = "Y" ]; then
+                ask TUN_SPOOF_SRC "Spoof Source IP" ""
+                ask TUN_SPOOF_DST "Spoof Dest IP  " ""
+            else
+                TUN_SPOOF_SRC="" TUN_SPOOF_DST=""
+            fi
+            echo ""
+            ask TUN_DCPI_CHOICE "Enable DCPI Mode  (ICMPv6/proto58) (y/n)" "n"
+            [ "$TUN_DCPI_CHOICE" = "y" ] || [ "$TUN_DCPI_CHOICE" = "Y" ] && TUN_DCPI="yes" || TUN_DCPI="no"
+            echo ""
+            ;;
+    esac
+
+    if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "https" ] ||
+       { [ "$TRANSPORT" = "xhttps" ] && [ "$XHTTP_CDN" != "true" ]; }; then
+        ask_ssl_cert
+        echo ""
+    fi
+
+    ask_ports
+    echo ""
+
+    ask_socks5
+    echo ""
+
+    ask_dc
+    ask_advanced
+    echo ""
+
+    case "$TRANSPORT" in
+        tcp)     write_server_config_tcp     "$PORT" "$PSK" "${PORTS[@]}" ;;
+        ws)      write_server_config_ws      "$PORT" "$PSK" "$WS_PATH" "${PORTS[@]}" ;;
+        wss)     write_server_config_wss     "$PORT" "$PSK" "$WS_PATH" "$CERT_FILE" "$KEY_FILE" "${PORTS[@]}" ;;
+        http)    write_server_config_http    "$PORT" "$PSK" "$HTTP_DOMAIN" "$HTTP_PATH" "${PORTS[@]}" ;;
+        https)   write_server_config_https   "$PORT" "$PSK" "$HTTP_DOMAIN" "$HTTP_PATH" "$CERT_FILE" "$KEY_FILE" "${PORTS[@]}" ;;
+        quantum) write_server_config_quantum "$PORT" "$PSK" "$QM_MTU" "$QM_BLOCK" "${PORTS[@]}" ;;
+        quantum+) write_server_config_quantumplus "$PORT" "$PSK" "${PORTS[@]}" ;;
+        xhttp)   write_server_config_xhttp   "$PORT" "$PSK" "$XHTTP_PATH" "false" "" "" \
+                     "$XHTTP_CDN" "$XHTTP_CDN_HOST" "$XHTTP_CDN_PORT" "$XHTTP_CDN_IPS" "$XHTTP_INSECURE" \
+                     "$XHTTP_CDN_POOL" "$XHTTP_PEER_IP" "${PORTS[@]}" ;;
+        xhttps)  write_server_config_xhttp   "$PORT" "$PSK" "$XHTTP_PATH" "true" "$CERT_FILE" "$KEY_FILE" \
+                     "$XHTTP_CDN" "$XHTTP_CDN_HOST" "$XHTTP_CDN_PORT" "$XHTTP_CDN_IPS" "$XHTTP_INSECURE" \
+                     "$XHTTP_CDN_POOL" "$XHTTP_PEER_IP" "${PORTS[@]}" ;;
+        tun)     write_server_config_tun     "$PORT" "$PSK" "$TUN_LOCAL_IP" "$TUN_PEER_IP" "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR" "$TUN_ENCAP" "$TUN_PROFILE" "$TUN_IFACE" "$TUN_SPOOF_SRC" "$TUN_SPOOF_DST" "$TUN_DCPI" "$TUN_NAME" "$TUN_HEARTBEAT_SEC" "$TUN_IDLE_TIMEOUT_SEC" "${PORTS[@]}" ;;
+    esac
+    ok "Config written: ${CONFIG}"
+
+    install_service
+    start_service
+
+    echo ""
+    echo -e "${GREEN}${BOLD}  Server installed successfully.${NC}"
+    echo ""
+    echo -e "  Service   : ${BOLD}${SERVICE_NAME}${NC}"
+    echo -e "  Channel   : ${BOLD}${CHANNEL}${NC}"
+    echo -e "  Version   : ${BOLD}${VERSION}${NC}"
+    echo -e "  Public IP : ${BOLD}${SERVER_PUBLIC_IP}${NC}"
+    echo -e "  Transport : ${BOLD}${TRANSPORT}${NC}"
+    echo -e "  Port      : ${BOLD}${PORT}${NC}"
+    echo -e "  PSK       : ${BOLD}${PSK}${NC}"
+    [ "$TRANSPORT" = "ws"  ] && echo -e "  WS Path   : ${BOLD}${WS_PATH}${NC}"
+    if [ "$TRANSPORT" = "wss" ]; then
+        echo -e "  WS Path   : ${BOLD}${WS_PATH}${NC}"
+        echo -e "  SSL Mode  : ${BOLD}${SSL_MODE}${NC}"
+        [ "$SSL_MODE" = "auto" ] && echo -e "  Domain    : ${BOLD}${DOMAIN}${NC}"
+        echo -e "  Cert      : ${BOLD}${CERT_FILE}${NC}"
+        echo -e "  Key       : ${BOLD}${KEY_FILE}${NC}"
+    fi
+    if [ "$TRANSPORT" = "http" ]; then
+        echo -e "  Fake Domain : ${BOLD}${HTTP_DOMAIN}${NC}"
+        echo -e "  Fake Path   : ${BOLD}${HTTP_PATH}${NC}"
+    fi
+    if [ "$TRANSPORT" = "https" ]; then
+        echo -e "  Fake Domain : ${BOLD}${HTTP_DOMAIN}${NC}"
+        echo -e "  Fake Path   : ${BOLD}${HTTP_PATH}${NC}"
+        echo -e "  SSL Mode    : ${BOLD}${SSL_MODE}${NC}"
+        [ "$SSL_MODE" = "auto" ] && echo -e "  Domain      : ${BOLD}${DOMAIN}${NC}"
+        echo -e "  Cert        : ${BOLD}${CERT_FILE}${NC}"
+        echo -e "  Key         : ${BOLD}${KEY_FILE}${NC}"
+    fi
+    if [ "$TRANSPORT" = "quantum" ]; then
+        echo -e "  Interface : ${BOLD}auto-detect${NC}"
+        echo -e "  MTU       : ${BOLD}${QM_MTU}${NC}"
+        echo -e "  Block     : ${BOLD}${QM_BLOCK}${NC}"
+    fi
+    if [ "$TRANSPORT" = "quantum+" ]; then
+        echo -e "  Core      : ${BOLD}rawmux (dagMux, FEC 10/1)${NC}"
+        echo -e "  ${YELLOW}Open UDP ${PORT} AND UDP $((PORT + 10000)) (knock port) in your firewall.${NC}"
+    fi
+    if [ "$TRANSPORT" = "xhttp" ] || [ "$TRANSPORT" = "xhttps" ]; then
+        echo -e "  URL path  : ${BOLD}${XHTTP_PATH}${NC}  ${DIM}(the other side must use the same one)${NC}"
+        if [ "$XHTTP_CDN" = "true" ]; then
+            echo -e "  Cloudflare: ${BOLD}on — this side dials OUT${NC}"
+            echo -e "  Domain    : ${BOLD}${XHTTP_CDN_HOST}${NC}  ${DIM}(this is what decides where traffic goes)${NC}"
+            echo -e "  CF port   : ${BOLD}${XHTTP_CDN_PORT}${NC}"
+            echo -e "  Edge IPs  : ${BOLD}${XHTTP_CDN_IPS}${NC}  ${DIM}(tried in this order)${NC}"
+            echo -e "  ${DIM}Nothing needs opening in this firewall — this side only dials out.${NC}"
+            echo -e "  ${DIM}The far side must be running and reachable through Cloudflare.${NC}"
+        fi
+        if [ "$TRANSPORT" = "xhttps" ] && [ "$XHTTP_CDN" != "true" ]; then
+            echo -e "  SSL Mode  : ${BOLD}${SSL_MODE}${NC}"
+            [ "$SSL_MODE" = "auto" ] && echo -e "  Domain    : ${BOLD}${DOMAIN}${NC}"
+            echo -e "  Cert      : ${BOLD}${CERT_FILE}${NC}"
+        fi
+        echo ""
+        echo -e "  ${DIM}To put this behind Cloudflare: point a proxied (orange cloud) domain${NC}"
+        echo -e "  ${DIM}at this server, and make sure port ${PORT} is one Cloudflare forwards${NC}"
+        echo -e "  ${DIM}(HTTPS: 443, 2053, 2083, 2087, 2096, 8443).${NC}"
+        echo -e "  ${DIM}Anything that is not a tunnel request gets a plain 404 page, so the${NC}"
+        echo -e "  ${DIM}domain looks like an ordinary website to anyone who probes it.${NC}"
+    fi
+    if [ "$TRANSPORT" = "tun" ]; then
+        echo -e "  Encap     : ${BOLD}${TUN_ENCAP}${NC}"
+        echo -e "  Profile   : ${BOLD}${TUN_PROFILE}${NC}"
+        echo -e "  TUN Local : ${BOLD}${TUN_LOCAL_ADDR}${NC}"
+        echo -e "  TUN Peer  : ${BOLD}${TUN_REMOTE_ADDR}${NC}"
+        echo -e "  Wire IP   : ${BOLD}${TUN_LOCAL_IP} -> ${TUN_PEER_IP}${NC}"
+        echo -e "  Device    : ${BOLD}${TUN_NAME}${NC}"
+    fi
+    if [ "$SOCKS5_ENABLED" = "true" ]; then
+        echo -e "  SOCKS5    : ${BOLD}${SOCKS5_BIND}${NC}  (standalone, independent of maps)"
+    fi
+    echo -e "  Config    : ${BOLD}${CONFIG}${NC}"
+    echo ""
+    echo -e "  Logs      : journalctl -u ${SERVICE_NAME} -f"
+    echo ""
+}
+
+install_client() {
+    hr "Install Client"
+    ensure_launcher client
+    check_ptrace_scope
+    tune_network
+    echo ""
+
+    ask_service_name
+    echo ""
+
+    CHANNEL="release"
+    VERSION="latest"
+    info "Version : ${VERSION} (${CHANNEL})"
+    echo ""
+
+    ask_transport
+    echo ""
+
+    if [ "$TRANSPORT" != "tun" ] && [ "$TRANSPORT" != "xhttp" ] && [ "$TRANSPORT" != "xhttps" ]; then
+        ask_connection_pool
+    fi
+
+    if [ "$TRANSPORT" = "tun" ]; then
+        SERVER_PORT="8443"
+    elif [ "$TRANSPORT" = "xhttp" ] || [ "$TRANSPORT" = "xhttps" ]; then
+        :
+    else
+        while true; do
+            echo -e "        Example : 1.1.1.1:8443"
+            ask SERVER_ADDR "Server IP And Port" ""
+            SERVER_IP="${SERVER_ADDR%%:*}"
+            SERVER_PORT="${SERVER_ADDR##*:}"
+            if [ -z "$SERVER_IP" ] || [ -z "$SERVER_PORT" ] || [ "$SERVER_IP" = "$SERVER_PORT" ]; then
+                warn "Invalid format. Use IP:PORT (e.g. 1.1.1.1:8443)"
+            else
+                break
+            fi
+        done
+        echo ""
+    fi
+
+    ask_required PSK "PSK  (must match server)"
+    echo ""
+
+    case "$TRANSPORT" in
+        ws|wss)
+            ask WS_PATH "WebSocket path  (must match server)" "/ws"
+            echo ""
+            ;;
+        http|https)
+            ask HTTP_DOMAIN "Fake domain  (must match server)" "www.google.com"
+            ask HTTP_PATH   "Fake path    (must match server)" "/search"
+            echo ""
+            ;;
+        xhttp|xhttps)
+            ask_xhttp client
+            if [ "$TRANSPORT" = "xhttps" ]; then
+                ask_xhttp_cdn client
+            else
+                XHTTP_CDN="false"; XHTTP_CDN_HOST=""; XHTTP_CDN_PORT="80"
+                XHTTP_CDN_IPS=""; XHTTP_INSECURE="true"; XHTTP_ORIGIN_PORT="8443"
+                XHTTP_PEER_IP=""; XHTTP_PUBLIC_IP=""; XHTTP_CDN_POOL="4"
+            fi
+            if [ "$XHTTP_CDN" = "true" ]; then
+                echo ""
+                while true; do
+                    ask_required SERVER_IP "Server IP"
+                    if ! validate_ip "$SERVER_IP"; then
+                        warn "That is not an IP address."
+                        continue
+                    fi
+                    if [ -n "$XHTTP_PUBLIC_IP" ] && [ "$SERVER_IP" = "$XHTTP_PUBLIC_IP" ]; then
+                        warn "That is the same as the Client IP (${XHTTP_PUBLIC_IP})."
+                        warn "These are two different servers — one of the two is wrong."
+                        continue
+                    fi
+                    break
+                done
+                echo ""
+                ok "Client IP : ${XHTTP_PUBLIC_IP:-not stated}"
+                ok "Server IP : ${SERVER_IP}"
+                SERVER_PORT="$XHTTP_ORIGIN_PORT"
+                CLIENT_CONN_POOL=4
+
+                echo ""
+                echo -e "  ${BOLD}Certificate for Cloudflare to connect to${NC}"
+                ask_ssl_cert
+            else
+                echo ""
+                ask_connection_pool
+                while true; do
+                    echo -e "        Example : 1.1.1.1:8443"
+                    ask SERVER_ADDR "Server IP And Port" ""
+                    SERVER_IP="${SERVER_ADDR%%:*}"
+                    SERVER_PORT="${SERVER_ADDR##*:}"
+                    if [ -z "$SERVER_IP" ] || [ -z "$SERVER_PORT" ] || [ "$SERVER_IP" = "$SERVER_PORT" ]; then
+                        warn "Invalid format. Use IP:PORT (e.g. 1.1.1.1:8443)"
+                    else
+                        break
+                    fi
+                done
+            fi
+            echo ""
+            ;;
+        quantum)
+            echo -e "  ${DIM}Quantum auto-detects the network interface, source IP, and${NC}"
+            echo -e "  ${DIM}gateway MAC at runtime — nothing to configure for those.${NC}"
+            echo ""
+            ask QM_MTU   "MTU" "1350"
+            ask QM_BLOCK "KCP header cipher  (must match server, aes/salsa20/none)" "aes"
+            echo ""
+            ;;
+        tun)
+            echo ""
+            echo -e "  ${BOLD}TUN Encapsulation / profile (must match server):${NC}"
+            echo "    1)  tcp   2)  udp   3)  icmp   4)  gre   5)  ipip   6)  bip"
+            echo ""
+            ask TUN_PROFILE_CHOICE "Profile" "1"
+            case "$TUN_PROFILE_CHOICE" in
+                2|udp)  TUN_PROFILE="udp"  ;;
+                3|icmp) TUN_PROFILE="icmp" ;;
+                4|gre)  TUN_PROFILE="gre"  ;;
+                5|ipip) TUN_PROFILE="ipip" ;;
+                6|bip)  TUN_PROFILE="bip"  ;;
+                *)      TUN_PROFILE="tcp"  ;;
+            esac
+            TUN_ENCAP="ipx"
+            TUN_L4_PORT=""
+            if [ "$TUN_PROFILE" = "tcp" ] || [ "$TUN_PROFILE" = "udp" ]; then
+                echo ""
+                echo -e "  ${DIM}L4 service port — must match the server's value exactly.${NC}"
+                ask TUN_L4_PORT "L4 service port" "443"
+            fi
+            echo ""
+            _DEFAULT_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+            ask TUN_LOCAL_IP "Client real IP" "${_DEFAULT_IP}"
+            ask_required TUN_PEER_IP "Server real IP"
+            echo ""
+            ask_required TUN_LOCAL_ADDR  "TUN local IP   (client side, any IP, e.g. 10.0.0.2)"
+            ask_required TUN_REMOTE_ADDR "TUN remote IP  (server side, any IP, e.g. 10.0.0.1)"
+            TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
+            TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
+            echo ""
+            ask TUN_IFACE "Network interface  (leave empty for auto-detect)" ""
+            ask TUN_NAME  "TUN device name" "dagger0"
+            echo ""
+            ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec)  -- doesn't need to match the server, but similar values make sense" "5"
+            ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)  -- how long with no traffic before reconnecting" "60"
+            ask_tun_profile
+            echo ""
+            ask TUN_SPOOF_CHOICE "Enable IP Spoof (y/n)" "n"
+            if [ "$TUN_SPOOF_CHOICE" = "y" ] || [ "$TUN_SPOOF_CHOICE" = "Y" ]; then
+                ask TUN_SPOOF_SRC "Spoof Source IP" ""
+                ask TUN_SPOOF_DST "Spoof Dest IP  " ""
+            else
+                TUN_SPOOF_SRC="" TUN_SPOOF_DST=""
+            fi
+            echo ""
+            ask TUN_DCPI_CHOICE "Enable DCPI Mode  (ICMPv6/proto58) (y/n)" "n"
+            [ "$TUN_DCPI_CHOICE" = "y" ] || [ "$TUN_DCPI_CHOICE" = "Y" ] && TUN_DCPI="yes" || TUN_DCPI="no"
+            echo ""
+            ;;
+    esac
+
+    if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "https" ]; then
+        echo ""
+    fi
+
+    ask_dc
+    ask_advanced
+    echo ""
+
+    case "$TRANSPORT" in
+        tcp)     write_client_config_tcp     "$SERVER_IP" "$SERVER_PORT" "$PSK" ;;
+        ws)      write_client_config_ws      "$SERVER_IP" "$SERVER_PORT" "$PSK" "$WS_PATH" ;;
+        wss)     write_client_config_wss     "$SERVER_IP" "$SERVER_PORT" "$PSK" "$WS_PATH" ;;
+        http)    write_client_config_http    "$SERVER_IP" "$SERVER_PORT" "$PSK" "$HTTP_DOMAIN" "$HTTP_PATH" ;;
+        https)   write_client_config_https   "$SERVER_IP" "$SERVER_PORT" "$PSK" "$HTTP_DOMAIN" "$HTTP_PATH" ;;
+        quantum) write_client_config_quantum "$SERVER_IP" "$SERVER_PORT" "$PSK" "$QM_MTU" "$QM_BLOCK" ;;
+        quantum+) write_client_config_quantumplus "$SERVER_IP" "$SERVER_PORT" "$PSK" ;;
+        xhttp)   write_client_config_xhttp   "$SERVER_IP" "$SERVER_PORT" "$PSK" "$XHTTP_PATH" "$XHTTP_MODE" "false" \
+                     "$XHTTP_INSECURE" "$XHTTP_CDN" "$XHTTP_CDN_HOST" "$XHTTP_CDN_PORT" "$XHTTP_CDN_IPS" \
+                     "$XHTTP_ORIGIN_PORT" "$CERT_FILE" "$KEY_FILE" "$XHTTP_PUBLIC_IP" ;;
+        xhttps)  write_client_config_xhttp   "$SERVER_IP" "$SERVER_PORT" "$PSK" "$XHTTP_PATH" "$XHTTP_MODE" "true" \
+                     "$XHTTP_INSECURE" "$XHTTP_CDN" "$XHTTP_CDN_HOST" "$XHTTP_CDN_PORT" "$XHTTP_CDN_IPS" \
+                     "$XHTTP_ORIGIN_PORT" "$CERT_FILE" "$KEY_FILE" "$XHTTP_PUBLIC_IP" ;;
+        tun)     write_client_config_tun     "$SERVER_PORT" "$PSK" "$TUN_LOCAL_IP" "$TUN_PEER_IP" "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR" "$TUN_ENCAP" "$TUN_PROFILE" "$TUN_IFACE" "$TUN_SPOOF_SRC" "$TUN_SPOOF_DST" "$TUN_DCPI" "$TUN_NAME" "$TUN_HEARTBEAT_SEC" "$TUN_IDLE_TIMEOUT_SEC" ;;
+    esac
+    ok "Config written: ${CONFIG}"
+
+    install_service
+    start_service
+
+    echo ""
+    echo -e "${GREEN}${BOLD}  Client installed successfully.${NC}"
+    echo ""
+    echo -e "  Service   : ${BOLD}${SERVICE_NAME}${NC}"
+    echo -e "  Channel   : ${BOLD}${CHANNEL}${NC}"
+    echo -e "  Version   : ${BOLD}${VERSION}${NC}"
+    echo -e "  Transport : ${BOLD}${TRANSPORT}${NC}"
+    if [ "$TRANSPORT" = "tun" ]; then
+        echo -e "  Server    : ${BOLD}${TUN_PEER_IP}${NC}  ${DIM}(tun — no listen port)${NC}"
+    else
+        echo -e "  Server    : ${BOLD}${SERVER_IP}:${SERVER_PORT}${NC}"
+    fi
+    echo -e "  PSK       : ${BOLD}${PSK}${NC}"
+    [ "$TRANSPORT" = "ws"  ] && echo -e "  WS Path   : ${BOLD}${WS_PATH}${NC}"
+    if [ "$TRANSPORT" = "wss" ]; then
+        echo -e "  WS Path   : ${BOLD}${WS_PATH}${NC}"
+    fi
+    if [ "$TRANSPORT" = "http" ]; then
+        echo -e "  Fake Domain : ${BOLD}${HTTP_DOMAIN}${NC}"
+        echo -e "  Fake Path   : ${BOLD}${HTTP_PATH}${NC}"
+    fi
+    if [ "$TRANSPORT" = "https" ]; then
+        echo -e "  Fake Domain : ${BOLD}${HTTP_DOMAIN}${NC}"
+        echo -e "  Fake Path   : ${BOLD}${HTTP_PATH}${NC}"
+    fi
+    if [ "$TRANSPORT" = "quantum" ]; then
+        echo -e "  Interface : ${BOLD}auto-detect${NC}"
+        echo -e "  MTU       : ${BOLD}${QM_MTU}${NC}"
+        echo -e "  Block     : ${BOLD}${QM_BLOCK}${NC}"
+    fi
+    if [ "$TRANSPORT" = "xhttp" ] || [ "$TRANSPORT" = "xhttps" ]; then
+        echo -e "  URL path  : ${BOLD}${XHTTP_PATH}${NC}"
+        echo -e "  Upload    : ${BOLD}${XHTTP_MODE}${NC}"
+        if [ "$XHTTP_CDN" = "true" ]; then
+            echo -e "  Route     : ${BOLD}Cloudflare — this side is the ORIGIN${NC}"
+            echo -e "  Waiting on: ${BOLD}0.0.0.0:${XHTTP_ORIGIN_PORT}${NC}"
+            echo ""
+            echo -e "  ${YELLOW}Two things must be true for this to work:${NC}"
+            echo -e "  ${DIM}1. Your domain's DNS record points at THIS server, orange cloud on.${NC}"
+            echo -e "  ${DIM}2. Port ${XHTTP_ORIGIN_PORT} is open in this firewall so Cloudflare can reach it.${NC}"
+            echo ""
+            echo -e "  ${DIM}This side no longer dials anywhere — the Iran server opens the${NC}"
+            echo -e "  ${DIM}connection to a Cloudflare address, and Cloudflare brings it here.${NC}"
+        else
+            echo -e "  Route     : ${BOLD}direct to the server${NC}"
+        fi
+    fi
+    echo -e "  Config    : ${BOLD}${CONFIG}${NC}"
+    echo ""
+    echo -e "  Logs      : journalctl -u ${SERVICE_NAME} -f"
+    echo ""
+}
+
+show_status() {
+    hr "Service Status"
+    echo ""
+
+    mapfile -t SERVICES < <(list_services)
+
+    if [ ${#SERVICES[@]} -eq 0 ]; then
+        warn "No DaggerConnect services found."
+        return
+    fi
+
+    for svc in "${SERVICES[@]}"; do
+        echo -e "${BOLD}${svc}${NC}"
+        systemctl status "$svc" --no-pager --lines=5 2>/dev/null || true
+        echo ""
+    done
+}
+
+show_logs() {
+    hr "Logs"
+    echo ""
+
+    mapfile -t SERVICES < <(list_services)
+
+    if [ ${#SERVICES[@]} -eq 0 ]; then
+        warn "No DaggerConnect services found."
+        return
+    fi
+
+    if [ ${#SERVICES[@]} -eq 1 ]; then
+        TARGET="${SERVICES[0]}"
+    else
+        echo "Available services:"
+        for i in "${!SERVICES[@]}"; do
+            echo "  $((i+1)))  ${SERVICES[$i]}"
+        done
+        echo ""
+        ask IDX "Select number" "1"
+        TARGET="${SERVICES[$((IDX-1))]}"
+    fi
+
+    journalctl -u "$TARGET" -n 80 --no-pager
+}
+
+uninstall() {
+    hr "Remove"
+    echo ""
+
+    mapfile -t SERVICES < <(list_services)
+
+    if [ ${#SERVICES[@]} -eq 0 ]; then
+        warn "No DaggerConnect services found."
+        return
+    fi
+
+    echo "Installed services:"
+    for i in "${!SERVICES[@]}"; do
+        echo "  $((i+1)))  ${SERVICES[$i]}"
+    done
+    echo "  a)  Remove ALL"
+    echo ""
+    ask IDX "Select number (or a)" ""
+
+    if [ "$IDX" = "a" ]; then
+        TARGETS=("${SERVICES[@]}")
+    else
+        TARGETS=("${SERVICES[$((IDX-1))]}")
+    fi
+
+    echo ""
+    warn "Will stop and remove: ${TARGETS[*]}"
+    ask CONFIRM "Confirm? (yes/no)" "no"
+    [ "$CONFIRM" != "yes" ] && { info "Cancelled."; return; }
+
+    for svc in "${TARGETS[@]}"; do
+        svc_name="${svc%.service}"
+        systemctl stop    "$svc_name" 2>/dev/null || true
+        systemctl disable "$svc_name" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${svc_name}.service"
+        cfg_json="${CONFIG_DIR}/${svc_name}.json"
+        cfg_yaml="${CONFIG_DIR}/${svc_name}.yaml"
+        [ -f "$cfg_json" ] && rm -f "$cfg_json" && ok "Removed config: ${cfg_json}"
+        [ -f "$cfg_yaml" ] && rm -f "$cfg_yaml" && ok "Removed config: ${cfg_yaml}"
+        rm -f "/etc/letsencrypt/renewal-hooks/deploy/daggerconnect-${svc_name}.sh" 2>/dev/null || true
+        ok "Removed service: ${svc_name}"
+    done
+
+    systemctl daemon-reload
+    [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR")" ] && rmdir "$CONFIG_DIR"
+    ok "Done."
+}
+
+PICKED_SVC=""
+pick_service() {
+    PICKED_SVC=""
+    local prompt="${1:-Select service}"
+    mapfile -t SERVICES < <(list_services)
+
+    if [ ${#SERVICES[@]} -eq 0 ]; then
+        warn "No DaggerConnect services found."
+        return 1
+    fi
+
+    if [ ${#SERVICES[@]} -eq 1 ]; then
+        PICKED_SVC="${SERVICES[0]}"
+        return 0
+    fi
+
+    echo -e "  ${BOLD}Available services:${NC}"
+    for i in "${!SERVICES[@]}"; do
+        local st="stopped"
+        systemctl is-active --quiet "${SERVICES[$i]}" && st="${GREEN}running${NC}" || st="${RED}stopped${NC}"
+        echo -e "    $((i+1)))  ${SERVICES[$i]}   [${st}]"
+    done
+    echo ""
+    ask IDX "$prompt (number)" "1"
+    if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt ${#SERVICES[@]} ]; then
+        warn "Invalid selection."
+        return 1
+    fi
+    PICKED_SVC="${SERVICES[$((IDX-1))]}"
+    return 0
+}
+
+show_logs_live() {
+    hr "Live Logs"
+    echo ""
+    pick_service "Follow logs for" || return 0
+    info "Following ${PICKED_SVC} — press Ctrl+C to return to the menu."
+    echo ""
+    trap ' ' INT
+    journalctl -u "$PICKED_SVC" -n 40 -f --no-pager
+    trap - INT
+    echo ""
+    ok "Stopped following logs."
+}
+
+service_control() {
+    hr "Service Control"
+    echo ""
+    pick_service "Manage" || return 0
+    local svc="$PICKED_SVC"
+
+    echo ""
+    local st
+    systemctl is-active --quiet "$svc" && st="${GREEN}running${NC}" || st="${RED}stopped${NC}"
+    echo -e "  Selected : ${BOLD}${svc}${NC}   [${st}]"
+    echo ""
+    echo "  1)  Restart"
+    echo "  2)  Stop"
+    echo "  3)  Start"
+    echo "  4)  Status"
+    echo "  0)  Back"
+    echo ""
+    ask ACT "Action" "1"
+
+    case "$ACT" in
+        1)
+            step "Restarting ${svc} ..."
+            systemctl restart "$svc"
+            sleep 2
+            if systemctl is-active --quiet "$svc"; then ok "Running."; else warn "Failed to start — see logs."; fi
+            ;;
+        2)
+            step "Stopping ${svc} ..."
+            systemctl stop "$svc" && ok "Stopped." || warn "Could not stop."
+            ;;
+        3)
+            step "Starting ${svc} ..."
+            systemctl start "$svc"
+            sleep 2
+            if systemctl is-active --quiet "$svc"; then ok "Running."; else warn "Failed to start — see logs."; fi
+            ;;
+        4)
+            systemctl status "$svc" --no-pager --lines=10 2>/dev/null || true
+            ;;
+        0|"") return 0 ;;
+        *) warn "Invalid action." ;;
+    esac
+}
+
+edit_config() {
+    hr "Edit Config"
+    echo ""
+    pick_service "Edit config for" || return 0
+    local svc="${PICKED_SVC%.service}"
+
+    local cfg=""
+    [ -f "${CONFIG_DIR}/${svc}.json" ] && cfg="${CONFIG_DIR}/${svc}.json"
+    [ -f "${CONFIG_DIR}/${svc}.yaml" ] && cfg="${CONFIG_DIR}/${svc}.yaml"
+    if [ -z "$cfg" ]; then
+        warn "No config file found for ${svc}."
+        return 0
+    fi
+
+    local ed="${EDITOR:-}"
+    if [ -z "$ed" ]; then
+        for cand in nano vim vi; do
+            command -v "$cand" >/dev/null 2>&1 && { ed="$cand"; break; }
+        done
+    fi
+    if [ -z "$ed" ]; then
+        warn "No editor found (nano/vim/vi). Install one: apt install nano"
+        return 0
+    fi
+
+    cp "$cfg" "${cfg}.bak" 2>/dev/null && info "Backup saved: ${cfg}.bak"
+    info "Opening ${cfg} in ${ed} ..."
+    "$ed" "$cfg"
+
+    echo ""
+    ask DORESTART "Restart the service to apply changes? (y/n)" "y"
+    if [ "$DORESTART" = "y" ] || [ "$DORESTART" = "Y" ]; then
+        step "Restarting ${svc} ..."
+        systemctl restart "${svc}"
+        sleep 2
+        if systemctl is-active --quiet "${svc}"; then ok "Running with new config."; else
+            warn "Service failed to start — config may be invalid."
+            ask REVERT "Restore backup and restart? (y/n)" "y"
+            if [ "$REVERT" = "y" ] || [ "$REVERT" = "Y" ]; then
+                cp "${cfg}.bak" "$cfg" && systemctl restart "${svc}" && ok "Reverted to previous config."
+            fi
+        fi
+    fi
+}
+
+show_banner() {
+    echo ""
+    echo -e "  ${CYAN}${BOLD}DaggerConnect Installer (Offline Edition)${NC}  -  @DaggerConnect"
+    echo ""
+}
+
+show_menu() {
+    echo -e "${BOLD}  Select an option:${NC}"
+    echo ""
+    echo -e "  ${BOLD}Install${NC}"
+    echo "    1)  Install Server"
+    echo "    2)  Install Client"
+    echo ""
+    echo -e "  ${BOLD}Manage${NC}"
+    echo "    3)  Service Status"
+    echo "    4)  Service Control  (restart / stop / start)"
+    echo "    5)  Edit Config"
+    echo ""
+    echo -e "  ${BOLD}Logs${NC}"
+    echo "    6)  View Logs        (last 80 lines)"
+    echo "    7)  Live Logs        (follow)"
+    echo ""
+    echo -e "  ${BOLD}Other${NC}"
+    echo "    8)  Remove"
+    echo "    9)  Switch Release Channel  (release / beta + version)"
+    echo "   10)  Update Launcher (Offline: uses ./DaggerLauncher)"
+    echo "    0)  Exit"
+    echo ""
+    ask CHOICE "Choice" ""
+}
+
+run_action() {
+    ( "$@" )
+    return 0
+}
+
+pause() {
+    echo ""
+    echo -ne "${YELLOW}?${NC} Press Enter to return to the menu: "
+    read -r _
+}
+
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
+    return 0 2>/dev/null || true
+fi
+
+[ "$EUID" -ne 0 ] && { echo -e "${RED}[ERR ]${NC}  Run as root: sudo bash setup.sh"; exit 1; }
+
+while true; do
+    clear 2>/dev/null || true
+    show_banner
+    show_menu
+
+    case "$CHOICE" in
+        1) run_action install_server ;;
+        2) run_action install_client ;;
+        3) run_action show_status     ;;
+        4) run_action service_control ;;
+        5) run_action edit_config     ;;
+        6) run_action show_logs       ;;
+        7) run_action show_logs_live  ;;
+        8) run_action uninstall       ;;
+        9) run_action switch_channel  ;;
+        10) run_action update_launcher ;;
+        0) echo -e "\n  ${CYAN}Bye.${NC}\n"; exit 0 ;;
+        *) warn "Invalid choice: ${CHOICE}" ;;
+    esac
+
+    pause
+done
