@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# === DaggerConnect Complete Installer (Ultimate Edition) ===
-# Smart binary + Status + Full Uninstall + /dev/tty fix
+# === DaggerConnect Ultimate Installer (TUN Fix Edition) ===
+# Smart binary + Status + Full Uninstall + TUN Interface Auto-Setup
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -43,6 +43,7 @@ TUN_IFACE=""
 TUN_NAME="dagger0"
 TUN_HEARTBEAT_SEC="5"
 TUN_IDLE_TIMEOUT_SEC="60"
+TUN_MTU="1400"
 
 _ts()   { date '+%H:%M:%S'; }
 info()  { echo -e "${DIM}$(_ts)${NC} ${CYAN}[INFO]${NC}  $*"; }
@@ -52,23 +53,19 @@ step()  { echo -e "${DIM}$(_ts)${NC} ${MAGENTA}[STEP]${NC}  $*"; }
 error() { echo -e "${DIM}$(_ts)${NC} ${RED}[ERR ]${NC}  $*"; exit 1; }
 hr()    { echo -e "\n${BOLD}${CYAN}══ $* ══${NC}"; }
 
-# 🎯 FIXED: Use /dev/tty to prevent infinite loop
 ask() {
     local var="$1" prompt="$2" default="$3"
     local input=""
-    
     if [ -n "$default" ]; then
         echo -ne "${YELLOW}?${NC} $prompt [${default}]: " > /dev/tty
     else
         echo -ne "${YELLOW}?${NC} $prompt: " > /dev/tty
     fi
-    
     if [ -c /dev/tty ]; then
         read -r input < /dev/tty
     else
         read -r input
     fi
-    
     [ -z "$input" ] && [ -n "$default" ] && input="$default"
     eval "$var=\"$input\""
 }
@@ -118,10 +115,8 @@ ask_service_name() {
     info "Config File  : ${CONFIG}"
 }
 
-# 🎯 SMART: Auto-finds ANY patched binary
 download_binary() {
     hr "Downloading Cracked Binary"
-    
     local tmp_dir="/tmp/dagger-install-$$"
     mkdir -p "$tmp_dir"
     
@@ -149,13 +144,7 @@ download_binary() {
     
     find . -maxdepth 1 -type f -exec chmod +x {} \;
     
-    echo ""
-    info "Files extracted:"
-    ls -la --color=always | grep -v "^d" | grep -v "^total"
-    echo ""
-    
     local exe_file=""
-    
     for f in DaggerConnect3.2.patched DaggerConnect.patched dagger.patched dagger-cracked core-patched DaggerConnect dagger dagger-core core; do
         if [ -f "$f" ] && file "$f" 2>/dev/null | grep -qE "ELF|executable"; then
             exe_file="$f"
@@ -163,43 +152,15 @@ download_binary() {
         fi
     done
     
-    if [ -z "$exe_file" ]; then
-        exe_file=$(find . -maxdepth 1 -type f -name "*.patched" | head -1)
-    fi
-    
-    if [ -z "$exe_file" ]; then
-        exe_file=$(find . -maxdepth 1 -type f -iname "*dagger*" | head -1)
-    fi
-    
-    if [ -z "$exe_file" ]; then
-        for f in $(find . -maxdepth 1 -type f); do
-            if file "$f" 2>/dev/null | grep -q "ELF"; then
-                exe_file="$f"
-                break
-            fi
-        done
-    fi
-    
-    if [ -z "$exe_file" ]; then
-        exe_file=$(find . -maxdepth 1 -type f -executable | head -1)
-    fi
+    [ -z "$exe_file" ] && exe_file=$(find . -maxdepth 1 -type f -name "*.patched" | head -1)
+    [ -z "$exe_file" ] && exe_file=$(find . -maxdepth 1 -type f -iname "*dagger*" | head -1)
+    [ -z "$exe_file" ] && exe_file=$(find . -maxdepth 1 -type f -executable | head -1)
     
     if [ -z "$exe_file" ]; then
         warn "Could not auto-detect binary. Available files:" > /dev/tty
         find . -maxdepth 1 -type f
-        echo ""
         ask MANUAL_BIN "Enter the filename manually (without ./)" ""
-        if [ -f "./$MANUAL_BIN" ]; then
-            exe_file="./$MANUAL_BIN"
-        else
-            error "File not found: $MANUAL_BIN"
-        fi
-    fi
-    
-    if ! file "$exe_file" 2>/dev/null | grep -qE "ELF|executable"; then
-        warn "Warning: $exe_file might not be a valid binary."
-    else
-        ok "Verified: $exe_file is a valid executable"
+        [ -f "./$MANUAL_BIN" ] && exe_file="./$MANUAL_BIN" || error "File not found: $MANUAL_BIN"
     fi
     
     info "Found executable: ${BOLD}$exe_file${NC}"
@@ -213,18 +174,15 @@ download_binary() {
 
 test_binary() {
     info "Testing binary..."
-    local output
-    output=$($LAUNCHER --version 2>&1)
+    local output=$($LAUNCHER --version 2>&1)
     local exit_code=$?
     if [ $exit_code -eq 0 ] || echo "$output" | grep -qiE "version|dagger|connect"; then
         ok "Binary is working!"
     else
         warn "Binary test output: $output"
-        info "Continuing anyway (binary may require config to work)."
     fi
 }
 
-# 🆕 NEW: Comprehensive Status & Health Check
 show_status() {
     hr "DaggerConnect Status & Health"
     
@@ -233,15 +191,7 @@ show_status() {
     if [ -f "$LAUNCHER" ]; then
         ok "Binary exists: $LAUNCHER"
         file "$LAUNCHER" | grep -q "ELF" && ok "Binary is valid ELF executable" || warn "Binary might be corrupted"
-        
-        local size=$(stat -c%s "$LAUNCHER" 2>/dev/null || stat -f%z "$LAUNCHER" 2>/dev/null)
-        info "Binary size: $size bytes"
-        
-        if $LAUNCHER --version 2>/dev/null | grep -qiE "version|dagger|connect"; then
-            ok "Binary responds to --version"
-        else
-            warn "Binary doesn't respond properly to --version"
-        fi
+        info "Binary size: $(stat -c%s "$LAUNCHER" 2>/dev/null || stat -f%z "$LAUNCHER") bytes"
     else
         error "Binary not found at $LAUNCHER"
     fi
@@ -253,8 +203,6 @@ show_status() {
         warn "No running DaggerConnect services found"
     else
         echo "$services"
-        echo ""
-        info "Service details:"
         for svc in $(systemctl list-units --type=service --state=running 2>/dev/null | grep -i dagger | awk '{print $1}'); do
             echo -e "${CYAN}=== $svc ===${NC}"
             systemctl status "$svc" --no-pager -l | head -20
@@ -262,60 +210,42 @@ show_status() {
     fi
     
     echo ""
-    echo -e "${BOLD}${BLUE}3. Listening Ports:${NC}"
-    if command -v ss &>/dev/null; then
-        ss -tlnp 2>/dev/null | grep -i dagger || warn "No listening ports found for DaggerConnect"
+    echo -e "${BOLD}${BLUE}3. TUN Interfaces:${NC}"
+    if command -v ip &>/dev/null; then
+        ip -br link show | grep -E "dagger|tun|tunl" || warn "No TUN interfaces found"
         echo ""
-        info "All listening TCP ports:"
-        ss -tln | grep -v "127.0.0.1" | grep -v "::1" || warn "No external listening ports"
-    else
-        netstat -tlnp 2>/dev/null | grep -i dagger || warn "No listening ports found"
+        info "TUN interface IPs:"
+        ip -br addr show | grep -E "dagger|tun|tunl" || warn "No TUN IPs assigned"
     fi
     
     echo ""
-    echo -e "${BOLD}${BLUE}4. Config Files:${NC}"
+    echo -e "${BOLD}${BLUE}4. Listening Ports:${NC}"
+    if command -v ss &>/dev/null; then
+        ss -tlnp 2>/dev/null | grep -i dagger || warn "No listening ports found for DaggerConnect"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}5. Config Files:${NC}"
     if [ -d "$CONFIG_DIR" ]; then
-        ls -la "$CONFIG_DIR" 2>/dev/null
-        echo ""
-        info "Config contents:"
         for cfg in "$CONFIG_DIR"/*; do
-            if [ -f "$cfg" ]; then
-                echo -e "${CYAN}=== $cfg ===${NC}"
-                head -30 "$cfg"
-            fi
+            [ -f "$cfg" ] && { echo -e "${CYAN}=== $cfg ===${NC}"; head -30 "$cfg"; }
         done
     else
         warn "Config directory not found: $CONFIG_DIR"
     fi
     
     echo ""
-    echo -e "${BOLD}${BLUE}5. Recent Logs:${NC}"
-    local found_logs=false
+    echo -e "${BOLD}${BLUE}6. Recent Logs (last 15 lines):${NC}"
     for svc in $(systemctl list-units --type=service --all 2>/dev/null | grep -i dagger | awk '{print $1}'); do
-        found_logs=true
-        echo -e "${CYAN}=== $svc (last 15 lines) ===${NC}"
+        echo -e "${CYAN}=== $svc ===${NC}"
         journalctl -u "$svc" -n 15 --no-pager 2>/dev/null || echo "No logs available"
     done
     
-    if [ "$found_logs" = false ]; then
-        warn "No DaggerConnect services found for logs"
-    fi
-    
     echo ""
-    echo -e "${BOLD}${BLUE}6. Connection Test:${NC}"
-    if [ -n "$SERVER_PUBLIC_IP" ]; then
-        info "Testing connection to server IP: $SERVER_PUBLIC_IP"
-        if ping -c 2 -W 2 "$SERVER_PUBLIC_IP" &>/dev/null; then
-            ok "Server IP is reachable"
-        else
-            warn "Server IP is not reachable"
-        fi
-    else
-        info "Server IP not configured for testing"
-    fi
+    echo -e "${BOLD}${BLUE}7. Active Connections:${NC}"
+    ss -tnp 2>/dev/null | grep -i dagger || warn "No active connections"
 }
 
-# 🆕 NEW: Full Uninstall - Remove EVERYTHING
 full_uninstall() {
     hr "Full Uninstall"
     
@@ -323,74 +253,43 @@ full_uninstall() {
     echo "  - All DaggerConnect services"
     echo "  - Binary at $LAUNCHER"
     echo "  - Config directory at $CONFIG_DIR"
+    echo "  - All TUN interfaces (dagger*)"
     echo "  - All logs and temporary files"
     echo ""
     
     ask CONFIRM "Are you ABSOLUTELY sure? Type 'yes' to continue" "no"
+    [ "$CONFIRM" != "yes" ] && { info "Cancelled."; return; }
     
-    if [ "$CONFIRM" != "yes" ]; then
-        info "Cancelled. Nothing was removed."
-        return
-    fi
-    
-    # Step 1: Stop and disable all services
-    step "Stopping and removing services..."
-    local services=$(systemctl list-units --type=service --all 2>/dev/null | grep -i dagger | awk '{print $1}' | sed 's/.service//')
-    
-    if [ -n "$services" ]; then
-        for svc in $services; do
-            systemctl stop "$svc" 2>/dev/null
-            systemctl disable "$svc" 2>/dev/null
-            rm -f "/etc/systemd/system/${svc}.service"
-            ok "Removed service: $svc"
-        done
-    else
-        info "No services found to remove"
-    fi
-    
+    step "Stopping services..."
+    for svc in $(systemctl list-units --type=service --all 2>/dev/null | grep -i dagger | awk '{print $1}' | sed 's/.service//'); do
+        systemctl stop "$svc" 2>/dev/null
+        systemctl disable "$svc" 2>/dev/null
+        rm -f "/etc/systemd/system/${svc}.service"
+        ok "Removed service: $svc"
+    done
     systemctl daemon-reload
     systemctl reset-failed 2>/dev/null
     
-    # Step 2: Remove binary
+    step "Removing TUN interfaces..."
+    for iface in $(ip -br link show 2>/dev/null | grep -E "dagger|tun0" | awk '{print $1}'); do
+        ip link delete "$iface" 2>/dev/null && ok "Removed TUN: $iface"
+    done
+    
     step "Removing binary..."
-    if [ -f "$LAUNCHER" ]; then
-        rm -f "$LAUNCHER"
-        ok "Removed binary: $LAUNCHER"
-    else
-        info "Binary not found"
-    fi
+    rm -f "$LAUNCHER" && ok "Removed binary"
     
-    # Step 3: Remove configs
     step "Removing configs..."
-    if [ -d "$CONFIG_DIR" ]; then
-        rm -rf "$CONFIG_DIR"
-        ok "Removed config directory: $CONFIG_DIR"
-    else
-        info "Config directory not found"
-    fi
+    rm -rf "$CONFIG_DIR" && ok "Removed config directory"
     
-    # Step 4: Remove logs
-    step "Removing logs..."
-    journalctl --vacuum-time=1s 2>/dev/null | grep -i dagger || true
-    
-    # Step 5: Remove temp files
-    step "Removing temporary files..."
-    rm -rf /tmp/dagger-install-* 2>/dev/null
-    rm -rf /tmp/DaggerConnect* 2>/dev/null
-    
-    # Step 6: Remove from PATH if symlinked
-    if [ -L "/usr/local/bin/dagger" ]; then
-        rm -f "/usr/local/bin/dagger"
-        ok "Removed symlink: /usr/local/bin/dagger"
-    fi
+    step "Removing temp files..."
+    rm -rf /tmp/dagger-install-* /tmp/DaggerConnect* 2>/dev/null
     
     echo ""
     ok "Full uninstall complete! System is clean."
 }
 
 detect_server_public_ip() {
-    local ip
-    ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+    local ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
     [ -n "$ip" ] && { echo "$ip"; return 0; }
     return 1
 }
@@ -626,6 +525,7 @@ write_client_config_http() {
 EOF
 }
 
+# 🎯 FIXED: TUN Server Config with health_check and proper settings
 write_server_config_tun() {
     local port="$1" psk="$2" local_ip="$3" peer_ip="$4" local_addr="$5" remote_addr="$6"; shift 6
     local ports_json=$(build_ports_json "$@")
@@ -650,6 +550,7 @@ ${ports_json}
     "name": "${TUN_NAME}",
     "local_addr": "${local_addr}",
     "remote_addr": "${remote_addr}",
+    "mtu": ${TUN_MTU},
     "heartbeat_sec": ${TUN_HEARTBEAT_SEC},
     "idle_timeout_sec": ${TUN_IDLE_TIMEOUT_SEC}
   },
@@ -658,11 +559,17 @@ ${ports_json}
     "profile": "${TUN_PROFILE}",
     "listen_ip": "${local_ip}",
     "dst_ip": "${peer_ip}"
+  },
+  "health_check": {
+    "enabled": true,
+    "interval_sec": 10,
+    "timeout_sec": 5
   }
 }
 EOF
 }
 
+# 🎯 FIXED: TUN Client Config with health_check and proper settings
 write_client_config_tun() {
     local server_port="$1" psk="$2" local_ip="$3" peer_ip="$4" local_addr="$5" remote_addr="$6"
     mkdir -p "$CONFIG_DIR"
@@ -685,6 +592,7 @@ write_client_config_tun() {
     "name": "${TUN_NAME}",
     "local_addr": "${local_addr}",
     "remote_addr": "${remote_addr}",
+    "mtu": ${TUN_MTU},
     "heartbeat_sec": ${TUN_HEARTBEAT_SEC},
     "idle_timeout_sec": ${TUN_IDLE_TIMEOUT_SEC}
   },
@@ -693,9 +601,73 @@ write_client_config_tun() {
     "profile": "${TUN_PROFILE}",
     "listen_ip": "${local_ip}",
     "dst_ip": "${peer_ip}"
+  },
+  "health_check": {
+    "enabled": true,
+    "interval_sec": 10,
+    "timeout_sec": 5
   }
 }
 EOF
+}
+
+# 🆕 NEW: Setup TUN interface manually before service starts
+setup_tun_interface() {
+    local mode="$1"  # "server" or "client"
+    local tun_name="$2"
+    local local_addr="$3"
+    local remote_addr="$4"
+    
+    hr "Setting up TUN Interface: ${tun_name}"
+    
+    step "Loading TUN kernel module..."
+    modprobe tun 2>/dev/null || true
+    
+    # Check if interface already exists
+    if ip link show "$tun_name" &>/dev/null; then
+        warn "Interface $tun_name already exists. Removing..."
+        ip link delete "$tun_name" 2>/dev/null
+        sleep 1
+    fi
+    
+    step "Creating TUN interface: $tun_name"
+    ip tuntap add dev "$tun_name" mode tun user root 2>/dev/null || \
+    ip tuntap add dev "$tun_name" mode tun 2>/dev/null || {
+        warn "ip tuntap failed, trying alternative method..."
+    }
+    
+    if ! ip link show "$tun_name" &>/dev/null; then
+        error "Failed to create TUN interface $tun_name"
+    fi
+    ok "Interface $tun_name created"
+    
+    step "Bringing interface up..."
+    ip link set "$tun_name" up
+    ip link set "$tun_name" mtu ${TUN_MTU:-1400}
+    ok "Interface is UP with MTU ${TUN_MTU:-1400}"
+    
+    step "Assigning IP addresses..."
+    if [ "$mode" = "server" ]; then
+        ip addr add "${local_addr}/30" dev "$tun_name" 2>/dev/null || \
+        ip addr add "${local_addr}/24" dev "$tun_name"
+        ok "Server IP assigned: ${local_addr}"
+        # Add route to client
+        ip route add "${remote_addr}/32" dev "$tun_name" 2>/dev/null || true
+        ok "Route to client added: ${remote_addr}"
+    else
+        ip addr add "${local_addr}/30" dev "$tun_name" 2>/dev/null || \
+        ip addr add "${local_addr}/24" dev "$tun_name"
+        ok "Client IP assigned: ${local_addr}"
+        # Add route to server
+        ip route add "${remote_addr}/32" dev "$tun_name" 2>/dev/null || true
+        ok "Route to server added: ${remote_addr}"
+    fi
+    
+    echo ""
+    info "TUN Interface Status:"
+    ip -br addr show "$tun_name"
+    echo ""
+    ok "TUN interface setup complete!"
 }
 
 install_service() {
@@ -707,12 +679,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/sbin/modprobe tun
 ExecStart=${LAUNCHER} -c ${CONFIG}
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=DaggerConnect
+# Ensure it has permissions to create TUN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -769,6 +745,11 @@ install_server() {
             ask_required TUN_REMOTE_ADDR "TUN remote IP (client side, e.g. 10.0.0.2)"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
+            ask TUN_MTU "MTU (1400 recommended)" "1400"
+            echo ""
+            
+            # 🆕 Setup TUN interface BEFORE writing config
+            setup_tun_interface "server" "$TUN_NAME" "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR"
             echo "" ;;
     esac
     ask_ports
@@ -799,6 +780,7 @@ install_server() {
         echo -e "  TUN Local : ${BOLD}${TUN_LOCAL_ADDR}${NC}"
         echo -e "  TUN Peer  : ${BOLD}${TUN_REMOTE_ADDR}${NC}"
         echo -e "  Wire IP   : ${BOLD}${TUN_LOCAL_IP} -> ${TUN_PEER_IP}${NC}"
+        echo -e "  MTU       : ${BOLD}${TUN_MTU}${NC}"
     fi
     echo -e "  Config    : ${BOLD}${CONFIG}${NC}"
     echo ""
@@ -850,6 +832,11 @@ install_client() {
             ask_required TUN_REMOTE_ADDR "TUN remote IP (server side, e.g. 10.0.0.1)"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
+            ask TUN_MTU "MTU (1400 recommended)" "1400"
+            echo ""
+            
+            # 🆕 Setup TUN interface BEFORE writing config
+            setup_tun_interface "client" "$TUN_NAME" "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR"
             echo "" ;;
     esac
     case "$TRANSPORT" in
@@ -868,6 +855,9 @@ install_client() {
     echo -e "  Transport : ${BOLD}${TRANSPORT}${NC}"
     if [ "$TRANSPORT" = "tun" ]; then
         echo -e "  Server    : ${BOLD}${TUN_PEER_IP}${NC}"
+        echo -e "  TUN Local : ${BOLD}${TUN_LOCAL_ADDR}${NC}"
+        echo -e "  TUN Peer  : ${BOLD}${TUN_REMOTE_ADDR}${NC}"
+        echo -e "  MTU       : ${BOLD}${TUN_MTU}${NC}"
     else
         echo -e "  Server    : ${BOLD}${SERVER_IP}:${SERVER_PORT}${NC}"
     fi
@@ -877,19 +867,27 @@ install_client() {
         echo -e "  Fake Domain : ${BOLD}${HTTP_DOMAIN}${NC}"
         echo -e "  Fake Path   : ${BOLD}${HTTP_PATH}${NC}"
     fi
-    if [ "$TRANSPORT" = "tun" ]; then
-        echo -e "  TUN Local : ${BOLD}${TUN_LOCAL_ADDR}${NC}"
-        echo -e "  TUN Peer  : ${BOLD}${TUN_REMOTE_ADDR}${NC}"
-    fi
     echo -e "  Config    : ${BOLD}${CONFIG}${NC}"
     echo ""
     echo -e "  Logs      : journalctl -u ${SERVICE_NAME} -f"
+    echo ""
+    # 🆕 Test TUN connection
+    if [ "$TRANSPORT" = "tun" ]; then
+        echo ""
+        info "Testing TUN connectivity in 5 seconds..."
+        sleep 5
+        if ping -c 2 -W 2 "$TUN_REMOTE_ADDR" &>/dev/null; then
+            ok "TUN tunnel is working! You can ping $TUN_REMOTE_ADDR"
+        else
+            warn "TUN ping failed. Check logs with: journalctl -u ${SERVICE_NAME} -f"
+        fi
+    fi
     echo ""
 }
 
 show_banner() {
     echo ""
-    echo -e "  ${CYAN}${BOLD}DaggerConnect Ultimate Installer${NC}"
+    echo -e "  ${CYAN}${BOLD}DaggerConnect Ultimate Installer (TUN Fix Edition)${NC}"
     echo ""
 }
 
@@ -901,12 +899,12 @@ show_menu() {
     echo "  2) Install Client (with cracked binary)"
     echo ""
     echo -e "${CYAN}Management:${NC}"
-    echo "  3) Status & Health Check (NEW!)"
+    echo "  3) Status & Health Check"
     echo "  4) Re-download binary only"
     echo "  5) Test installed binary"
     echo ""
     echo -e "${RED}Cleanup:${NC}"
-    echo "  6) Full Uninstall - Remove EVERYTHING (NEW!)"
+    echo "  6) Full Uninstall - Remove EVERYTHING"
     echo ""
     echo "  0) Exit"
     echo ""
