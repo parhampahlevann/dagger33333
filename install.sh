@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# === DaggerConnect Complete Installer ===
-# Downloads cracked binary + Full offline installation with all features
+# === DaggerConnect Complete Installer (Smart Binary Finder) ===
+# Auto-detects ANY patched/cracked binary in the zip
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -26,10 +26,8 @@ PORT=""
 PSK=""
 CLIENT_CONN_POOL="8"
 
-# GitHub Release URL
 BINARY_URL="https://github.com/parhampahlevann/dagger/releases/download/v1.0/DaggerConnect3.2.zip"
 
-# Transport-specific vars
 WS_PATH=""
 HTTP_DOMAIN=""
 HTTP_PATH=""
@@ -85,48 +83,31 @@ validate_ip() {
 
 ask_service_name() {
     local svc_name svc_file
-
     while true; do
         ask LABEL "Service Name (e.g. iran1, client-home)" ""
-        if [ -z "$LABEL" ]; then
-            warn "Service Name cannot be empty."
-            continue
-        fi
-        if ! validate_label "$LABEL"; then
-            warn "Only letters, numbers, - and _ are allowed."
-            continue
-        fi
-
+        if [ -z "$LABEL" ]; then warn "Service Name cannot be empty."; continue; fi
+        if ! validate_label "$LABEL"; then warn "Only letters, numbers, - and _ are allowed."; continue; fi
         svc_name="${LABEL}"
         svc_file="/etc/systemd/system/${svc_name}.service"
-
         if [ -f "$svc_file" ] || [ -f "${CONFIG_DIR}/${svc_name}.json" ] || [ -f "${CONFIG_DIR}/${svc_name}.yaml" ]; then
             echo ""
             warn "Already exists: ${svc_name}"
             ask OVERWRITE "Overwrite? (y/n)" "n"
-            if [ "$OVERWRITE" = "y" ] || [ "$OVERWRITE" = "Y" ]; then
-                break
-            fi
+            if [ "$OVERWRITE" = "y" ] || [ "$OVERWRITE" = "Y" ]; then break; fi
             info "Enter a different service name."
             echo ""
             continue
         fi
         break
     done
-
     while true; do
         ask FMT "Config Format (json/yaml)" "json"
-        case "$FMT" in
-            json|yaml) break ;;
-            *) warn "Please enter json or yaml." ;;
-        esac
+        case "$FMT" in json|yaml) break ;; *) warn "Please enter json or yaml." ;; esac
     done
-
     CONFIG_FMT="$FMT"
     SERVICE_NAME="${LABEL}"
     SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
     CONFIG="${CONFIG_DIR}/${SERVICE_NAME}.${CONFIG_FMT}"
-
     echo ""
     info "Service Name : ${SERVICE_NAME}"
     info "Config File  : ${CONFIG}"
@@ -160,23 +141,73 @@ download_binary() {
         error "Failed to extract zip file."
     fi
     
+    # 🎯 SMART BINARY FINDER
+    # First, give execute permission to ALL extracted files
+    find . -maxdepth 1 -type f -exec chmod +x {} \;
+    
+    echo ""
+    info "Files extracted:"
+    ls -la --color=always | grep -v "^d" | grep -v "^total"
+    echo ""
+    
+    # Try multiple patterns in order
     local exe_file=""
-    for f in DaggerConnect dagger dagger-core core; do
-        if [ -f "$f" ] && [ -x "$f" ]; then
+    
+    # Pattern 1: Look for common patched names
+    for f in DaggerConnect3.2.patched DaggerConnect.patched dagger.patched dagger-cracked core-patched DaggerConnect dagger dagger-core core; do
+        if [ -f "$f" ] && file "$f" 2>/dev/null | grep -qE "ELF|executable"; then
             exe_file="$f"
             break
         fi
     done
     
+    # Pattern 2: Any .patched file
+    if [ -z "$exe_file" ]; then
+        exe_file=$(find . -maxdepth 1 -type f -name "*.patched" | head -1)
+    fi
+    
+    # Pattern 3: Any file containing "Dagger" (case-insensitive)
+    if [ -z "$exe_file" ]; then
+        exe_file=$(find . -maxdepth 1 -type f -iname "*dagger*" | head -1)
+    fi
+    
+    # Pattern 4: Any ELF binary (real executable)
+    if [ -z "$exe_file" ]; then
+        for f in $(find . -maxdepth 1 -type f); do
+            if file "$f" 2>/dev/null | grep -q "ELF"; then
+                exe_file="$f"
+                break
+            fi
+        done
+    fi
+    
+    # Pattern 5: Any executable file
     if [ -z "$exe_file" ]; then
         exe_file=$(find . -maxdepth 1 -type f -executable | head -1)
     fi
     
     if [ -z "$exe_file" ]; then
-        error "No executable file found in the zip archive."
+        warn "Could not auto-detect binary. Available files:"
+        find . -maxdepth 1 -type f
+        echo ""
+        ask MANUAL_BIN "Enter the filename manually (without ./)" ""
+        if [ -f "./$MANUAL_BIN" ]; then
+            exe_file="./$MANUAL_BIN"
+        else
+            error "File not found: $MANUAL_BIN"
+        fi
     fi
     
-    info "Found executable: $exe_file"
+    # Verify it's a real ELF binary
+    if ! file "$exe_file" 2>/dev/null | grep -qE "ELF|executable"; then
+        warn "Warning: $exe_file might not be a valid binary."
+    else
+        ok "Verified: $exe_file is a valid executable"
+    fi
+    
+    info "Found executable: ${BOLD}$exe_file${NC}"
+    
+    # Install the binary
     cp "$exe_file" "$LAUNCHER"
     chmod +x "$LAUNCHER"
     ok "Binary installed to: $LAUNCHER"
@@ -185,21 +216,29 @@ download_binary() {
     rm -rf "$tmp_dir"
 }
 
+test_binary() {
+    info "Testing binary..."
+    local output
+    output=$($LAUNCHER --version 2>&1)
+    local exit_code=$?
+    if [ $exit_code -eq 0 ] || echo "$output" | grep -qiE "version|dagger|connect"; then
+        ok "Binary is working!"
+    else
+        warn "Binary test output: $output"
+        info "Continuing anyway (binary may require config to work)."
+    fi
+}
+
 detect_server_public_ip() {
     local ip
     ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
-    if [ -n "$ip" ]; then
-        echo "$ip"
-        return 0
-    fi
+    [ -n "$ip" ] && { echo "$ip"; return 0; }
     return 1
 }
 
 ask_server_public_ip() {
     echo ""
-    local detected
-    detected=$(detect_server_public_ip)
-
+    local detected=$(detect_server_public_ip)
     if [ -n "$detected" ]; then
         info "Public IP : ${detected} (auto-detected)"
         ask USE_DETECTED "Use this IP? (y/n)" "y"
@@ -208,16 +247,10 @@ ask_server_public_ip() {
             return
         fi
     fi
-
     while true; do
         ask SERVER_PUBLIC_IP "Enter server public IP manually" "$detected"
-        if [ -z "$SERVER_PUBLIC_IP" ]; then
-            warn "IP cannot be empty."
-            continue
-        fi
-        if validate_ip "$SERVER_PUBLIC_IP"; then
-            break
-        fi
+        [ -z "$SERVER_PUBLIC_IP" ] && { warn "IP cannot be empty."; continue; }
+        validate_ip "$SERVER_PUBLIC_IP" && break
         warn "Invalid IP format."
     done
     info "Public IP : ${SERVER_PUBLIC_IP}"
@@ -259,10 +292,7 @@ ask_ports() {
         while true; do
             ask ptype "Type for '$P' (tcp/udp)" "tcp"
             ptype="$(echo "$ptype" | tr '[:upper:]' '[:lower:]')"
-            case "$ptype" in
-                tcp|udp) break ;;
-                *) warn "Please type 'tcp' or 'udp'." ;;
-            esac
+            case "$ptype" in tcp|udp) break ;; *) warn "Please type 'tcp' or 'udp'." ;; esac
         done
         IFS="," read -ra _parts <<< "$P"
         for _p in "${_parts[@]}"; do
@@ -271,24 +301,16 @@ ask_ports() {
             PORTS+=("${_p}/${ptype}")
         done
     done
-    if [ ${#PORTS[@]} -eq 0 ]; then
-        warn "No ports defined. Adding default 2222=22."
-        PORTS=("2222=22/tcp")
-    fi
+    [ ${#PORTS[@]} -eq 0 ] && { warn "No ports defined. Adding default 2222=22."; PORTS=("2222=22/tcp"); }
 }
 
 parse_port_entry() {
     local entry="$1" ptype="tcp" pbind ptarget
-    if [[ "$entry" == */* ]]; then
-        ptype="${entry##*/}"
-        entry="${entry%/*}"
-    fi
+    [[ "$entry" == */* ]] && { ptype="${entry##*/}"; entry="${entry%/*}"; }
     if [[ "$entry" == *=* ]]; then
-        pbind="${entry%%=*}"
-        ptarget="${entry#*=}"
+        pbind="${entry%%=*}"; ptarget="${entry#*=}"
     else
-        pbind="$entry"
-        ptarget="$entry"
+        pbind="$entry"; ptarget="$entry"
     fi
     echo "${ptype}|${pbind}|${ptarget}"
 }
@@ -298,18 +320,16 @@ build_ports_json() {
     for p in "$@"; do
         IFS='|' read -r ptype pbind ptarget <<< "$(parse_port_entry "$p")"
         if [ "$first" = "1" ]; then
-            printf '    { "type": "%s", "bind": "0.0.0.0:%s", "target": "127.0.0.1:%s" }' "$ptype" "$pbind" "$ptarget"
+            printf '        { "type": "%s", "bind": "0.0.0.0:%s", "target": "127.0.0.1:%s" }' "$ptype" "$pbind" "$ptarget"
             first=0
         else
-            printf ',\n    { "type": "%s", "bind": "0.0.0.0:%s", "target": "127.0.0.1:%s" }' "$ptype" "$pbind" "$ptarget"
+            printf ',\n        { "type": "%s", "bind": "0.0.0.0:%s", "target": "127.0.0.1:%s" }' "$ptype" "$pbind" "$ptarget"
         fi
     done
-    echo ""
 }
 
 write_server_config_tcp() {
-    local port="$1" psk="$2"
-    shift 2
+    local port="$1" psk="$2"; shift 2
     local ports_json=$(build_ports_json "$@")
     mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG" << EOF
@@ -354,8 +374,7 @@ EOF
 }
 
 write_server_config_ws() {
-    local port="$1" psk="$2" ws_path="$3"
-    shift 3
+    local port="$1" psk="$2" ws_path="$3"; shift 3
     local ports_json=$(build_ports_json "$@")
     mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG" << EOF
@@ -373,9 +392,7 @@ ${ports_json}
       ]
     }
   ],
-  "ws_settings": {
-    "path": "${ws_path}"
-  }
+  "ws_settings": { "path": "${ws_path}" }
 }
 EOF
 }
@@ -398,16 +415,13 @@ write_client_config_ws() {
       "dial_timeout": 10
     }
   ],
-  "ws_settings": {
-    "path": "${ws_path}"
-  }
+  "ws_settings": { "path": "${ws_path}" }
 }
 EOF
 }
 
 write_server_config_http() {
-    local port="$1" psk="$2" http_domain="$3" http_path="$4"
-    shift 4
+    local port="$1" psk="$2" http_domain="$3" http_path="$4"; shift 4
     local ports_json=$(build_ports_json "$@")
     mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG" << EOF
@@ -425,10 +439,7 @@ ${ports_json}
       ]
     }
   ],
-  "http_settings": {
-    "fake_domain": "${http_domain}",
-    "path": "${http_path}"
-  }
+  "http_settings": { "fake_domain": "${http_domain}", "path": "${http_path}" }
 }
 EOF
 }
@@ -451,17 +462,13 @@ write_client_config_http() {
       "dial_timeout": 10
     }
   ],
-  "http_settings": {
-    "fake_domain": "${http_domain}",
-    "path": "${http_path}"
-  }
+  "http_settings": { "fake_domain": "${http_domain}", "path": "${http_path}" }
 }
 EOF
 }
 
 write_server_config_tun() {
-    local port="$1" psk="$2" local_ip="$3" peer_ip="$4" local_addr="$5" remote_addr="$6"
-    shift 6
+    local port="$1" psk="$2" local_ip="$3" peer_ip="$4" local_addr="$5" remote_addr="$6"; shift 6
     local ports_json=$(build_ports_json "$@")
     mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG" << EOF
@@ -569,39 +576,31 @@ start_service() {
 
 install_server() {
     hr "Install Server (Cracked Version)"
-    
     download_binary
-    
+    test_binary
     echo ""
     ask_service_name
     echo ""
-    
     ask_server_public_ip
     echo ""
-    
     ask_transport
     echo ""
-    
     if [ "$TRANSPORT" = "tun" ]; then
         PORT="8443"
     else
         ask PORT "Listen port" "8443"
         echo ""
     fi
-    
     ask_required PSK "PSK (must match client)"
     echo ""
-    
     case "$TRANSPORT" in
         ws|wss)
             ask WS_PATH "WebSocket path" "/ws"
-            echo ""
-            ;;
+            echo "" ;;
         http|https)
             ask HTTP_DOMAIN "Fake domain (e.g. www.google.com)" "www.google.com"
             ask HTTP_PATH "Fake path (e.g. /search)" "/search"
-            echo ""
-            ;;
+            echo "" ;;
         tun)
             echo -e "  ${BOLD}TUN Configuration:${NC}"
             _DEFAULT_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
@@ -611,24 +610,19 @@ install_server() {
             ask_required TUN_REMOTE_ADDR "TUN remote IP (client side, e.g. 10.0.0.2)"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
-            echo ""
-            ;;
+            echo "" ;;
     esac
-    
     ask_ports
     echo ""
-    
     case "$TRANSPORT" in
-        tcp)     write_server_config_tcp "$PORT" "$PSK" "${PORTS[@]}" ;;
-        ws)      write_server_config_ws "$PORT" "$PSK" "$WS_PATH" "${PORTS[@]}" ;;
-        http)    write_server_config_http "$PORT" "$PSK" "$HTTP_DOMAIN" "$HTTP_PATH" "${PORTS[@]}" ;;
-        tun)     write_server_config_tun "$PORT" "$PSK" "$TUN_LOCAL_IP" "$TUN_PEER_IP" "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR" "${PORTS[@]}" ;;
+        tcp)  write_server_config_tcp "$PORT" "$PSK" "${PORTS[@]}" ;;
+        ws)   write_server_config_ws "$PORT" "$PSK" "$WS_PATH" "${PORTS[@]}" ;;
+        http) write_server_config_http "$PORT" "$PSK" "$HTTP_DOMAIN" "$HTTP_PATH" "${PORTS[@]}" ;;
+        tun)  write_server_config_tun "$PORT" "$PSK" "$TUN_LOCAL_IP" "$TUN_PEER_IP" "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR" "${PORTS[@]}" ;;
     esac
     ok "Config written: ${CONFIG}"
-    
     install_service
     start_service
-    
     echo ""
     echo -e "${GREEN}${BOLD}Server installed successfully!${NC}"
     echo ""
@@ -655,20 +649,14 @@ install_server() {
 
 install_client() {
     hr "Install Client (Cracked Version)"
-    
     download_binary
-    
+    test_binary
     echo ""
     ask_service_name
     echo ""
-    
     ask_transport
     echo ""
-    
-    if [ "$TRANSPORT" != "tun" ]; then
-        ask CLIENT_CONN_POOL "Connections per path" "8"
-    fi
-    
+    [ "$TRANSPORT" != "tun" ] && ask CLIENT_CONN_POOL "Connections per path" "8"
     if [ "$TRANSPORT" = "tun" ]; then
         SERVER_PORT="8443"
     else
@@ -684,20 +672,16 @@ install_client() {
         done
         echo ""
     fi
-    
     ask_required PSK "PSK (must match server)"
     echo ""
-    
     case "$TRANSPORT" in
         ws|wss)
             ask WS_PATH "WebSocket path (must match server)" "/ws"
-            echo ""
-            ;;
+            echo "" ;;
         http|https)
             ask HTTP_DOMAIN "Fake domain (must match server)" "www.google.com"
             ask HTTP_PATH "Fake path (must match server)" "/search"
-            echo ""
-            ;;
+            echo "" ;;
         tun)
             echo -e "  ${BOLD}TUN Configuration:${NC}"
             _DEFAULT_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
@@ -707,10 +691,8 @@ install_client() {
             ask_required TUN_REMOTE_ADDR "TUN remote IP (server side, e.g. 10.0.0.1)"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
-            echo ""
-            ;;
+            echo "" ;;
     esac
-    
     case "$TRANSPORT" in
         tcp)  write_client_config_tcp "$SERVER_IP" "$SERVER_PORT" "$PSK" ;;
         ws)   write_client_config_ws "$SERVER_IP" "$SERVER_PORT" "$PSK" "$WS_PATH" ;;
@@ -718,10 +700,8 @@ install_client() {
         tun)  write_client_config_tun "$SERVER_PORT" "$PSK" "$TUN_LOCAL_IP" "$TUN_PEER_IP" "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR" ;;
     esac
     ok "Config written: ${CONFIG}"
-    
     install_service
     start_service
-    
     echo ""
     echo -e "${GREEN}${BOLD}Client installed successfully!${NC}"
     echo ""
@@ -750,7 +730,7 @@ install_client() {
 
 show_banner() {
     echo ""
-    echo -e "  ${CYAN}${BOLD}DaggerConnect Cracked Installer${NC}"
+    echo -e "  ${CYAN}${BOLD}DaggerConnect Cracked Installer (Smart Edition)${NC}"
     echo ""
 }
 
@@ -760,14 +740,11 @@ show_menu() {
     echo "  1) Install Server (with cracked binary)"
     echo "  2) Install Client (with cracked binary)"
     echo "  3) Re-download binary only"
+    echo "  4) Test installed binary"
     echo "  0) Exit"
     echo ""
     ask CHOICE "Choice" "1"
 }
-
-if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
-    return 0 2>/dev/null || true
-fi
 
 [ "$EUID" -ne 0 ] && { echo -e "${RED}[ERR ]${NC} Run as root: sudo bash install.sh"; exit 1; }
 
@@ -775,15 +752,14 @@ while true; do
     clear 2>/dev/null || true
     show_banner
     show_menu
-
     case "$CHOICE" in
         1) install_server ;;
         2) install_client ;;
-        3) download_binary ;;
+        3) download_binary && test_binary ;;
+        4) test_binary ;;
         0) echo -e "\n  ${CYAN}Bye.${NC}\n"; exit 0 ;;
         *) warn "Invalid choice" ;;
     esac
-
     echo ""
     echo -ne "${YELLOW}?${NC} Press Enter to return to the menu: "
     read -r _
