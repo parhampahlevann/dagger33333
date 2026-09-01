@@ -1,13 +1,14 @@
 #!/bin/bash
 
-# === DaggerConnect Complete Installer (Final Edition) ===
-# Smart binary finder + /dev/tty fix + All features
+# === DaggerConnect Complete Installer (Ultimate Edition) ===
+# Smart binary + Status + Full Uninstall + /dev/tty fix
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
+BLUE='\033[0;34m'
 DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
@@ -51,7 +52,7 @@ step()  { echo -e "${DIM}$(_ts)${NC} ${MAGENTA}[STEP]${NC}  $*"; }
 error() { echo -e "${DIM}$(_ts)${NC} ${RED}[ERR ]${NC}  $*"; exit 1; }
 hr()    { echo -e "\n${BOLD}${CYAN}══ $* ══${NC}"; }
 
-# 🎯 FIXED: Use /dev/tty to prevent infinite loop with curl | bash
+# 🎯 FIXED: Use /dev/tty to prevent infinite loop
 ask() {
     local var="$1" prompt="$2" default="$3"
     local input=""
@@ -82,13 +83,8 @@ ask_required() {
     done
 }
 
-validate_label() {
-    echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'
-}
-
-validate_ip() {
-    echo "$1" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
-}
+validate_label() { echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'; }
+validate_ip() { echo "$1" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; }
 
 ask_service_name() {
     local svc_name svc_file
@@ -151,7 +147,6 @@ download_binary() {
         error "Failed to extract zip file."
     fi
     
-    # Give execute permission to ALL extracted files
     find . -maxdepth 1 -type f -exec chmod +x {} \;
     
     echo ""
@@ -161,7 +156,6 @@ download_binary() {
     
     local exe_file=""
     
-    # Pattern 1: Common patched names
     for f in DaggerConnect3.2.patched DaggerConnect.patched dagger.patched dagger-cracked core-patched DaggerConnect dagger dagger-core core; do
         if [ -f "$f" ] && file "$f" 2>/dev/null | grep -qE "ELF|executable"; then
             exe_file="$f"
@@ -169,17 +163,14 @@ download_binary() {
         fi
     done
     
-    # Pattern 2: Any .patched file
     if [ -z "$exe_file" ]; then
         exe_file=$(find . -maxdepth 1 -type f -name "*.patched" | head -1)
     fi
     
-    # Pattern 3: Any file containing "Dagger"
     if [ -z "$exe_file" ]; then
         exe_file=$(find . -maxdepth 1 -type f -iname "*dagger*" | head -1)
     fi
     
-    # Pattern 4: Any ELF binary
     if [ -z "$exe_file" ]; then
         for f in $(find . -maxdepth 1 -type f); do
             if file "$f" 2>/dev/null | grep -q "ELF"; then
@@ -189,7 +180,6 @@ download_binary() {
         done
     fi
     
-    # Pattern 5: Any executable
     if [ -z "$exe_file" ]; then
         exe_file=$(find . -maxdepth 1 -type f -executable | head -1)
     fi
@@ -232,6 +222,170 @@ test_binary() {
         warn "Binary test output: $output"
         info "Continuing anyway (binary may require config to work)."
     fi
+}
+
+# 🆕 NEW: Comprehensive Status & Health Check
+show_status() {
+    hr "DaggerConnect Status & Health"
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}1. Binary Status:${NC}"
+    if [ -f "$LAUNCHER" ]; then
+        ok "Binary exists: $LAUNCHER"
+        file "$LAUNCHER" | grep -q "ELF" && ok "Binary is valid ELF executable" || warn "Binary might be corrupted"
+        
+        local size=$(stat -c%s "$LAUNCHER" 2>/dev/null || stat -f%z "$LAUNCHER" 2>/dev/null)
+        info "Binary size: $size bytes"
+        
+        if $LAUNCHER --version 2>/dev/null | grep -qiE "version|dagger|connect"; then
+            ok "Binary responds to --version"
+        else
+            warn "Binary doesn't respond properly to --version"
+        fi
+    else
+        error "Binary not found at $LAUNCHER"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}2. Running Services:${NC}"
+    local services=$(systemctl list-units --type=service --state=running 2>/dev/null | grep -i dagger || true)
+    if [ -z "$services" ]; then
+        warn "No running DaggerConnect services found"
+    else
+        echo "$services"
+        echo ""
+        info "Service details:"
+        for svc in $(systemctl list-units --type=service --state=running 2>/dev/null | grep -i dagger | awk '{print $1}'); do
+            echo -e "${CYAN}=== $svc ===${NC}"
+            systemctl status "$svc" --no-pager -l | head -20
+        done
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}3. Listening Ports:${NC}"
+    if command -v ss &>/dev/null; then
+        ss -tlnp 2>/dev/null | grep -i dagger || warn "No listening ports found for DaggerConnect"
+        echo ""
+        info "All listening TCP ports:"
+        ss -tln | grep -v "127.0.0.1" | grep -v "::1" || warn "No external listening ports"
+    else
+        netstat -tlnp 2>/dev/null | grep -i dagger || warn "No listening ports found"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}4. Config Files:${NC}"
+    if [ -d "$CONFIG_DIR" ]; then
+        ls -la "$CONFIG_DIR" 2>/dev/null
+        echo ""
+        info "Config contents:"
+        for cfg in "$CONFIG_DIR"/*; do
+            if [ -f "$cfg" ]; then
+                echo -e "${CYAN}=== $cfg ===${NC}"
+                head -30 "$cfg"
+            fi
+        done
+    else
+        warn "Config directory not found: $CONFIG_DIR"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}5. Recent Logs:${NC}"
+    local found_logs=false
+    for svc in $(systemctl list-units --type=service --all 2>/dev/null | grep -i dagger | awk '{print $1}'); do
+        found_logs=true
+        echo -e "${CYAN}=== $svc (last 15 lines) ===${NC}"
+        journalctl -u "$svc" -n 15 --no-pager 2>/dev/null || echo "No logs available"
+    done
+    
+    if [ "$found_logs" = false ]; then
+        warn "No DaggerConnect services found for logs"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}${BLUE}6. Connection Test:${NC}"
+    if [ -n "$SERVER_PUBLIC_IP" ]; then
+        info "Testing connection to server IP: $SERVER_PUBLIC_IP"
+        if ping -c 2 -W 2 "$SERVER_PUBLIC_IP" &>/dev/null; then
+            ok "Server IP is reachable"
+        else
+            warn "Server IP is not reachable"
+        fi
+    else
+        info "Server IP not configured for testing"
+    fi
+}
+
+# 🆕 NEW: Full Uninstall - Remove EVERYTHING
+full_uninstall() {
+    hr "Full Uninstall"
+    
+    warn "This will remove EVERYTHING:"
+    echo "  - All DaggerConnect services"
+    echo "  - Binary at $LAUNCHER"
+    echo "  - Config directory at $CONFIG_DIR"
+    echo "  - All logs and temporary files"
+    echo ""
+    
+    ask CONFIRM "Are you ABSOLUTELY sure? Type 'yes' to continue" "no"
+    
+    if [ "$CONFIRM" != "yes" ]; then
+        info "Cancelled. Nothing was removed."
+        return
+    fi
+    
+    # Step 1: Stop and disable all services
+    step "Stopping and removing services..."
+    local services=$(systemctl list-units --type=service --all 2>/dev/null | grep -i dagger | awk '{print $1}' | sed 's/.service//')
+    
+    if [ -n "$services" ]; then
+        for svc in $services; do
+            systemctl stop "$svc" 2>/dev/null
+            systemctl disable "$svc" 2>/dev/null
+            rm -f "/etc/systemd/system/${svc}.service"
+            ok "Removed service: $svc"
+        done
+    else
+        info "No services found to remove"
+    fi
+    
+    systemctl daemon-reload
+    systemctl reset-failed 2>/dev/null
+    
+    # Step 2: Remove binary
+    step "Removing binary..."
+    if [ -f "$LAUNCHER" ]; then
+        rm -f "$LAUNCHER"
+        ok "Removed binary: $LAUNCHER"
+    else
+        info "Binary not found"
+    fi
+    
+    # Step 3: Remove configs
+    step "Removing configs..."
+    if [ -d "$CONFIG_DIR" ]; then
+        rm -rf "$CONFIG_DIR"
+        ok "Removed config directory: $CONFIG_DIR"
+    else
+        info "Config directory not found"
+    fi
+    
+    # Step 4: Remove logs
+    step "Removing logs..."
+    journalctl --vacuum-time=1s 2>/dev/null | grep -i dagger || true
+    
+    # Step 5: Remove temp files
+    step "Removing temporary files..."
+    rm -rf /tmp/dagger-install-* 2>/dev/null
+    rm -rf /tmp/DaggerConnect* 2>/dev/null
+    
+    # Step 6: Remove from PATH if symlinked
+    if [ -L "/usr/local/bin/dagger" ]; then
+        rm -f "/usr/local/bin/dagger"
+        ok "Removed symlink: /usr/local/bin/dagger"
+    fi
+    
+    echo ""
+    ok "Full uninstall complete! System is clean."
 }
 
 detect_server_public_ip() {
@@ -574,7 +728,7 @@ start_service() {
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         ok "Service is running."
     else
-        warn "Service failed to start. Logs:"
+        warn "Service failed to start. Checking logs..."
         journalctl -u "$SERVICE_NAME" -n 30 --no-pager
     fi
 }
@@ -735,17 +889,25 @@ install_client() {
 
 show_banner() {
     echo ""
-    echo -e "  ${CYAN}${BOLD}DaggerConnect Cracked Installer (Final Edition)${NC}"
+    echo -e "  ${CYAN}${BOLD}DaggerConnect Ultimate Installer${NC}"
     echo ""
 }
 
 show_menu() {
     echo -e "${BOLD}Select an option:${NC}"
     echo ""
+    echo -e "${GREEN}Installation:${NC}"
     echo "  1) Install Server (with cracked binary)"
     echo "  2) Install Client (with cracked binary)"
-    echo "  3) Re-download binary only"
-    echo "  4) Test installed binary"
+    echo ""
+    echo -e "${CYAN}Management:${NC}"
+    echo "  3) Status & Health Check (NEW!)"
+    echo "  4) Re-download binary only"
+    echo "  5) Test installed binary"
+    echo ""
+    echo -e "${RED}Cleanup:${NC}"
+    echo "  6) Full Uninstall - Remove EVERYTHING (NEW!)"
+    echo ""
     echo "  0) Exit"
     echo ""
     ask CHOICE "Choice" "1"
@@ -770,8 +932,10 @@ while true; do
     case "$CHOICE" in
         1) install_server ;;
         2) install_client ;;
-        3) download_binary && test_binary ;;
-        4) test_binary ;;
+        3) show_status ;;
+        4) download_binary && test_binary ;;
+        5) test_binary ;;
+        6) full_uninstall ;;
         0) echo -e "\n  ${CYAN}Bye.${NC}\n"; exit 0 ;;
         *) warn "Invalid choice" ;;
     esac
