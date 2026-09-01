@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# === DaggerConnect Complete Installer (Smart Binary Finder) ===
-# Auto-detects ANY patched/cracked binary in the zip
+# === DaggerConnect Complete Installer (Final Edition) ===
+# Smart binary finder + /dev/tty fix + All features
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -51,14 +51,23 @@ step()  { echo -e "${DIM}$(_ts)${NC} ${MAGENTA}[STEP]${NC}  $*"; }
 error() { echo -e "${DIM}$(_ts)${NC} ${RED}[ERR ]${NC}  $*"; exit 1; }
 hr()    { echo -e "\n${BOLD}${CYAN}══ $* ══${NC}"; }
 
+# 🎯 FIXED: Use /dev/tty to prevent infinite loop with curl | bash
 ask() {
     local var="$1" prompt="$2" default="$3"
+    local input=""
+    
     if [ -n "$default" ]; then
-        echo -ne "${YELLOW}?${NC} $prompt [${default}]: "
+        echo -ne "${YELLOW}?${NC} $prompt [${default}]: " > /dev/tty
     else
-        echo -ne "${YELLOW}?${NC} $prompt: "
+        echo -ne "${YELLOW}?${NC} $prompt: " > /dev/tty
     fi
-    read -r input
+    
+    if [ -c /dev/tty ]; then
+        read -r input < /dev/tty
+    else
+        read -r input
+    fi
+    
     [ -z "$input" ] && [ -n "$default" ] && input="$default"
     eval "$var=\"$input\""
 }
@@ -69,7 +78,7 @@ ask_required() {
         ask "$var" "$prompt" ""
         eval "local val=\$$var"
         [ -n "$val" ] && break
-        warn "This field cannot be empty."
+        warn "This field cannot be empty." > /dev/tty
     done
 }
 
@@ -113,6 +122,7 @@ ask_service_name() {
     info "Config File  : ${CONFIG}"
 }
 
+# 🎯 SMART: Auto-finds ANY patched binary
 download_binary() {
     hr "Downloading Cracked Binary"
     
@@ -141,8 +151,7 @@ download_binary() {
         error "Failed to extract zip file."
     fi
     
-    # 🎯 SMART BINARY FINDER
-    # First, give execute permission to ALL extracted files
+    # Give execute permission to ALL extracted files
     find . -maxdepth 1 -type f -exec chmod +x {} \;
     
     echo ""
@@ -150,10 +159,9 @@ download_binary() {
     ls -la --color=always | grep -v "^d" | grep -v "^total"
     echo ""
     
-    # Try multiple patterns in order
     local exe_file=""
     
-    # Pattern 1: Look for common patched names
+    # Pattern 1: Common patched names
     for f in DaggerConnect3.2.patched DaggerConnect.patched dagger.patched dagger-cracked core-patched DaggerConnect dagger dagger-core core; do
         if [ -f "$f" ] && file "$f" 2>/dev/null | grep -qE "ELF|executable"; then
             exe_file="$f"
@@ -166,12 +174,12 @@ download_binary() {
         exe_file=$(find . -maxdepth 1 -type f -name "*.patched" | head -1)
     fi
     
-    # Pattern 3: Any file containing "Dagger" (case-insensitive)
+    # Pattern 3: Any file containing "Dagger"
     if [ -z "$exe_file" ]; then
         exe_file=$(find . -maxdepth 1 -type f -iname "*dagger*" | head -1)
     fi
     
-    # Pattern 4: Any ELF binary (real executable)
+    # Pattern 4: Any ELF binary
     if [ -z "$exe_file" ]; then
         for f in $(find . -maxdepth 1 -type f); do
             if file "$f" 2>/dev/null | grep -q "ELF"; then
@@ -181,13 +189,13 @@ download_binary() {
         done
     fi
     
-    # Pattern 5: Any executable file
+    # Pattern 5: Any executable
     if [ -z "$exe_file" ]; then
         exe_file=$(find . -maxdepth 1 -type f -executable | head -1)
     fi
     
     if [ -z "$exe_file" ]; then
-        warn "Could not auto-detect binary. Available files:"
+        warn "Could not auto-detect binary. Available files:" > /dev/tty
         find . -maxdepth 1 -type f
         echo ""
         ask MANUAL_BIN "Enter the filename manually (without ./)" ""
@@ -198,7 +206,6 @@ download_binary() {
         fi
     fi
     
-    # Verify it's a real ELF binary
     if ! file "$exe_file" 2>/dev/null | grep -qE "ELF|executable"; then
         warn "Warning: $exe_file might not be a valid binary."
     else
@@ -206,8 +213,6 @@ download_binary() {
     fi
     
     info "Found executable: ${BOLD}$exe_file${NC}"
-    
-    # Install the binary
     cp "$exe_file" "$LAUNCHER"
     chmod +x "$LAUNCHER"
     ok "Binary installed to: $LAUNCHER"
@@ -730,7 +735,7 @@ install_client() {
 
 show_banner() {
     echo ""
-    echo -e "  ${CYAN}${BOLD}DaggerConnect Cracked Installer (Smart Edition)${NC}"
+    echo -e "  ${CYAN}${BOLD}DaggerConnect Cracked Installer (Final Edition)${NC}"
     echo ""
 }
 
@@ -744,6 +749,16 @@ show_menu() {
     echo "  0) Exit"
     echo ""
     ask CHOICE "Choice" "1"
+}
+
+pause() {
+    echo ""
+    echo -ne "${YELLOW}?${NC} Press Enter to return to the menu: " > /dev/tty
+    if [ -c /dev/tty ]; then
+        read -r _ < /dev/tty
+    else
+        read -r _
+    fi
 }
 
 [ "$EUID" -ne 0 ] && { echo -e "${RED}[ERR ]${NC} Run as root: sudo bash install.sh"; exit 1; }
@@ -760,7 +775,5 @@ while true; do
         0) echo -e "\n  ${CYAN}Bye.${NC}\n"; exit 0 ;;
         *) warn "Invalid choice" ;;
     esac
-    echo ""
-    echo -ne "${YELLOW}?${NC} Press Enter to return to the menu: "
-    read -r _
+    pause
 done
