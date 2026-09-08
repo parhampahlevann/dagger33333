@@ -1,16 +1,19 @@
 #!/bin/bash
 #
-# Gost Ip6 Script v2.5.1 (hardened/fixed fork)
+# Gost Ip6 Script v2.6.0 (hardened & optimized)
 # Original by Masoud Gb - Special Thanks Hamid Router
 #
-# Fixes in v2.5.1:
-#  - Added 'kcp' protocol to UDP socket watchdog check (prevented 15s restart loop).
-#  - Handled distinct asset formats for Gost v2 (.gz) and v3 (.tar.gz).
-#  - Added automatic CPU architecture detection (amd64 / arm64).
-#  - Fixed IPv4 octal-base parsing error for numbers with leading zeros.
-#  - Optimized watchdog socket lookup regex using word boundaries.
-#  - Fixed systemctl daemon-reload placement outside tunnel generation loops.
-#  - Added iproute2 to dependencies for reliable 'ss' execution.
+# Fixes in v2.6.0:
+#  - Resolved ARM naming mismatch: gost v2 uses armv8 instead of arm64.
+#  - Enforced IPv4 resolution (--inet4-only / -4) to prevent IPv6 DNS hangs on VPS.
+#  - Cleaned dead GitHub mirrors and prioritized active fast mirrors.
+#  - Hardened apt handling so failed repo updates do not abort installation.
+#  - Real runtime verification using 'gost -V' instead of relying only on ELF header checks.
+#  - Wrapped main_menu in an infinite interactive loop until exit (Option 11).
+#  - Added whitespace trimming for comma-separated port inputs.
+#  - Removed redundant LimitNPROC in systemd unit.
+#  - Included rollback/cleanup of iptables TCPMSS clamp rule during uninstallation.
+#  - Quoted watchdog EOF delimiter to prevent shell parameter expansion bugs.
 #
 set -o pipefail
 
@@ -30,7 +33,7 @@ REPO_UPDATE_URL="https://github.com/masoudgb/Gost-ip6/raw/main/install.sh"
 # ---------- helpers ----------
 require_root() {
     if [ "$EUID" -ne 0 ]; then
-        echo -e "${C_GREEN}Please run with root privileges.${C_RESET}"
+        echo -e "${C_RED}Please run with root privileges.${C_RESET}"
         exit 1
     fi
 }
@@ -70,12 +73,12 @@ looks_like_ipv4() {
 looks_like_ipv6() { [[ "$1" == *:* ]] && [[ "$1" != *.* || "$1" == *:*.* ]]; }
 
 banner() {
-    echo -e "${C_MAGENTA}  ___|              |        _ _|  _ \\   /
- |      _ \\    __|  __|        |  |   |  _ \\
- |   | (   | \\__ \\  |          |  ___/  (   |
-\\____|\\___/  ____/ \\__|      ___|_|    \\___/ ${C_RESET}"
+    echo -e "${C_MAGENTA}   ___|              |        _ _|  _ \   /
+ |      _ \    __|  __|        |   |   |  _ \
+ |   | (   | \__ \  |          |   ___/  (   |
+\____|\___/  ____/ \__|      ___|_|     \___/ ${C_RESET}"
     echo -e "${C_CYAN}Created By Masoud Gb  Special Thanks Hamid Router${C_RESET}"
-    echo -e "${C_MAGENTA}Gost Ip6 Script v2.5.1 (hardened & fixed)${C_RESET}"
+    echo -e "${C_MAGENTA}Gost Ip6 Script v2.6.0 (optimized & hardened)${C_RESET}"
 }
 
 ensure_self_installed() {
@@ -151,12 +154,13 @@ apply_kernel_tuning() {
 }
 
 # ---------- gost install ----------
-WGET_OPTS="--timeout=20 --tries=2 --waitretry=2"
-CURL_OPTS="--connect-timeout 10 --max-time 25 --retry 2 --retry-delay 2 -s"
-GH_MIRRORS=("" "https://gh-proxy.com/" "https://gh-proxy.org/" "https://ghproxy.net/")
+WGET_OPTS="--inet4-only --timeout=15 --tries=2 --waitretry=1"
+CURL_OPTS="-4 --connect-timeout 8 --max-time 20 --retry 2 --retry-delay 1 -s"
+GH_MIRRORS=("" "https://gh-proxy.com/")
 
 GOST2_PINNED_VERSION="2.11.5"
 GOST3_PINNED_VERSION="3.3.0"
+GOST3_AMD64_PINNED_SHA256="7cb67ca2b67f62e84d4ae8398e98bc01d1cbf9c8558cf41f6f1943c2c1c68bf9"
 
 is_elf_binary() { [ -f "$1" ] && [ "$(head -c4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; }
 
@@ -180,18 +184,26 @@ resolve_gost_release() {
         repo="ginuerzh/gost"
         pinned="$GOST2_PINNED_VERSION"
         version="$pinned"
-        asset="gost-linux-${arch}-${version}.gz"
+        local v2_arch="$arch"
+        [ "$arch" == "arm64" ] && v2_arch="armv8"
+        asset="gost-linux-${v2_arch}-${version}.gz"
         url="https://github.com/${repo}/releases/download/v${version}/${asset}"
     else
         repo="go-gost/gost"
         pinned="$GOST3_PINNED_VERSION"
 
-        version=$(curl $CURL_OPTS -o /dev/null -w '%{redirect_url}' "https://github.com/${repo}/releases/latest" 2>/dev/null \
-                  | grep -oE '[^/]+$' | sed 's/^v//')
+        for m in "${GH_MIRRORS[@]}"; do
+            version=$(curl $CURL_OPTS -o /dev/null -w '%{redirect_url}' "${m}https://github.com/${repo}/releases/latest" 2>/dev/null \
+                      | grep -oE '[^/]+$' | sed 's/^v//')
+            [ -n "$version" ] && break
+        done
 
         if [ -z "$version" ]; then
-            version=$(curl $CURL_OPTS "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
-                      | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -n1)
+            for m in "${GH_MIRRORS[@]}"; do
+                version=$(curl $CURL_OPTS "${m}https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+                          | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -n1)
+                [ -n "$version" ] && break
+            done
         fi
 
         if [ -z "$version" ]; then
@@ -207,14 +219,18 @@ resolve_gost_release() {
 }
 
 verify_checksum() {
-    local file="$1" repo="$2" version="$3" asset="$4" sums="/tmp/gost_checksums_$$.txt" expected actual
+    local file="$1" repo="$2" version="$3" asset="$4" arch="$5"
+    local sums="/tmp/gost_checksums_$$.txt" expected actual
 
-    if ! fetch_with_mirrors "https://github.com/${repo}/releases/download/v${version}/checksums.txt" "$sums"; then
-        return 0
+    if fetch_with_mirrors "https://github.com/${repo}/releases/download/v${version}/checksums.txt" "$sums"; then
+        expected=$(grep "  ${asset}\$" "$sums" | awk '{print $1}')
+        rm -f "$sums"
     fi
 
-    expected=$(grep "  ${asset}\$" "$sums" | awk '{print $1}')
-    rm -f "$sums"
+    if [ -z "$expected" ] && [ "$version" == "$GOST3_PINNED_VERSION" ] && [ "$arch" == "amd64" ]; then
+        expected="$GOST3_AMD64_PINNED_SHA256"
+    fi
+
     [ -z "$expected" ] && return 0
 
     actual=$(sha256sum "$file" | awk '{print $1}')
@@ -228,7 +244,8 @@ verify_checksum() {
 
 install_gost() {
     local version_choice="$1"
-    apt-get update -qq && apt-get install -y -qq wget nano tar curl gzip iproute2 > /dev/null
+    apt-get update -qq || true
+    apt-get install -y -qq wget nano tar curl gzip iproute2 > /dev/null 2>&1
 
     local arch; arch=$(detect_arch)
     local resolved version url asset repo
@@ -239,12 +256,12 @@ install_gost() {
 
     local download_target="/tmp/${asset}"
     if ! fetch_with_mirrors "$url" "$download_target"; then
-        echo -e "${C_RED}Download failed on all mirrors. Check network connectivity.${C_RESET}"
+        echo -e "${C_RED}Download failed on all endpoints. Check connectivity.${C_RESET}"
         return 1
     fi
 
     if [ "$version_choice" -eq 2 ]; then
-        verify_checksum "$download_target" "$repo" "$version" "$asset" || { rm -f "$download_target"; return 1; }
+        verify_checksum "$download_target" "$repo" "$version" "$asset" "$arch" || { rm -f "$download_target"; return 1; }
         tar -xzf "$download_target" -C /usr/local/bin/ gost 2>/dev/null
     else
         gzip -d -c "$download_target" > /usr/local/bin/gost 2>/dev/null
@@ -259,7 +276,15 @@ install_gost() {
         return 1
     fi
 
-    echo -e "${C_GREEN}Gost ${version} installed successfully.${C_RESET}"
+    local installed_ver
+    installed_ver=$(/usr/local/bin/gost -V 2>&1 | head -n1)
+    if [ $? -ne 0 ] || [ -z "$installed_ver" ]; then
+        echo -e "${C_RED}Binary execution test failed.${C_RESET}"
+        rm -f /usr/local/bin/gost
+        return 1
+    fi
+
+    echo -e "${C_GREEN}Gost ready: ${installed_ver}${C_RESET}"
 }
 
 ensure_gost_for_protocol() {
@@ -303,7 +328,13 @@ build_tunnel_service() {
         kcp)  suffix="?kcp.mode=fast" ;;
     esac
 
-    IFS=',' read -ra port_array <<< "$ports_csv"
+    IFS=',' read -ra raw_port_array <<< "$ports_csv"
+    local port_array=()
+    for p in "${raw_port_array[@]}"; do
+        p=$(echo "$p" | tr -d ' ')
+        [ -n "$p" ] && port_array+=("$p")
+    done
+
     local port_count=${#port_array[@]}
     local max_ports_per_unit=1000
     local file_count=$(( (port_count + max_ports_per_unit - 1) / max_ports_per_unit ))
@@ -335,7 +366,6 @@ Restart=always
 RestartSec=2
 TimeoutStopSec=5
 LimitNOFILE=1048576
-LimitNPROC=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -345,13 +375,18 @@ EOF
 
     systemctl daemon-reload
     for ((file_index = 0; file_index < file_count; file_index++)); do
-        systemctl restart "${unit_name}_${file_index}.service"
+        local u="${unit_name}_${file_index}.service"
+        systemctl restart "$u"
+        if ! systemctl is-active --quiet "$u"; then
+            echo -e "${C_RED}Failed to start ${u}. Journal tail:${C_RESET}"
+            journalctl -u "$u" -n 10 --no-pager
+        fi
     done
 
     apply_mss_clamp
     enable_watchdog silent
 
-    echo -e "${C_GREEN}Tunnel configuration applied (${file_count} service unit(s)). Watchdog is active.${C_RESET}"
+    echo -e "${C_GREEN}Tunnel configuration applied (${file_count} service unit(s)). Watchdog active.${C_RESET}"
 }
 
 apply_mss_clamp() {
@@ -360,6 +395,13 @@ apply_mss_clamp() {
         iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
         echo -e "${C_GREEN}MSS clamping enabled.${C_RESET}"
     fi
+}
+
+remove_mss_clamp() {
+    command -v iptables &>/dev/null || return 0
+    while iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do
+        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+    done
 }
 
 prompt_protocol() {
@@ -384,9 +426,10 @@ prompt_ports() {
     local opt ports_out
     opt=$(read_choice $'\e[32mPorts:\n\e[0m\e[36m1. \e[0mManual (comma separated)\n\e[36m2. \e[0mRange\n\e[32mYour choice: \e[0m' 1 2)
     if [ "$opt" -eq 1 ]; then
-        read -rp $'\e[36mEnter ports (comma separated): \e[0m' ports_out
+        read -rp $'\e[36mEnter ports (e.g. 80, 443, 8080): \e[0m' ports_out
         IFS=',' read -ra check_arr <<< "$ports_out"
         for p in "${check_arr[@]}"; do
+            p=$(echo "$p" | tr -d ' ')
             if ! is_number "$p" || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
                 echo -e "${C_RED}Invalid port: $p${C_RESET}" >&2; return 1
             fi
@@ -395,7 +438,8 @@ prompt_ports() {
         local range start end
         read -rp $'\e[36mEnter port range (e.g. 2000,2100): \e[0m' range
         IFS=',' read -ra rarr <<< "$range"
-        start="${rarr[0]:-}"; end="${rarr[1]:-}"
+        start=$(echo "${rarr[0]:-}" | tr -d ' ')
+        end=$(echo "${rarr[1]:-}" | tr -d ' ')
         if ! is_number "$start" || ! is_number "$end" || [ "$start" -lt 1 ] || [ "$end" -gt 65535 ] || [ "$start" -gt "$end" ]; then
             echo -e "${C_RED}Invalid range.${C_RESET}" >&2; return 1
         fi
@@ -407,6 +451,7 @@ prompt_ports() {
 action_create_tunnel() {
     local ip_version="$1" destination_ip ports protocol
     read -rp $'\e[97mEnter destination (Kharej) IP: \e[0m' destination_ip
+    destination_ip=$(echo "$destination_ip" | tr -d ' ')
     [ -z "$destination_ip" ] && { echo -e "${C_RED}IP cannot be empty.${C_RESET}"; return; }
 
     if [ "$ip_version" -eq 4 ] && ! looks_like_ipv4 "$destination_ip"; then
@@ -465,7 +510,7 @@ action_update_script() {
     fi
 
     local tmp="/tmp/gost_install_update.sh"
-    if ! wget -q -O "$tmp" "$REPO_UPDATE_URL" || [ ! -s "$tmp" ] || ! head -c 20 "$tmp" | grep -q '^#!'; then
+    if ! wget $WGET_OPTS -q -O "$tmp" "$REPO_UPDATE_URL" || [ ! -s "$tmp" ] || ! head -c 20 "$tmp" | grep -q '^#!'; then
         echo -e "${C_RED}Download failed or invalid script. Canceled.${C_RESET}"
         rm -f "$tmp"
         return 1
@@ -509,45 +554,45 @@ EOF
 
 # ---------- watchdog ----------
 generate_watchdog_script() {
-    cat > "$WATCHDOG_SCRIPT" <<WDEOF
+    cat > "$WATCHDOG_SCRIPT" <<'WDEOF'
 #!/bin/bash
-LOG="$WATCHDOG_LOG"
+LOG="/var/log/gost-watchdog.log"
 INTERVAL=15
 MAX_LOG_LINES=5000
 
-log() { echo "\$(date '+%Y-%m-%d %H:%M:%S') \$1" >> "\$LOG"; }
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"; }
 
 trim_log() {
-    [ -f "\$LOG" ] || return 0
-    local lines; lines=\$(wc -l < "\$LOG" 2>/dev/null || echo 0)
-    if [ "\$lines" -gt "\$MAX_LOG_LINES" ]; then
-        tail -n "\$MAX_LOG_LINES" "\$LOG" > "\${LOG}.tmp" && mv -f "\${LOG}.tmp" "\$LOG"
+    [ -f "$LOG" ] || return 0
+    local lines; lines=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+    if [ "$lines" -gt "$MAX_LOG_LINES" ]; then
+        tail -n "$MAX_LOG_LINES" "$LOG" > "${LOG}.tmp" && mv -f "${LOG}.tmp" "$LOG"
     fi
 }
 
 while true; do
     for unit in /etc/systemd/system/gost_*.service; do
-        [ -e "\$unit" ] || continue
-        name="\$(basename "\$unit" .service)"
+        [ -e "$unit" ] || continue
+        name="$(basename "$unit" .service)"
 
-        if ! systemctl is-active --quiet "\$name"; then
-            systemctl restart "\$name"
-            log "restarted \$name (was inactive)"
+        if ! systemctl is-active --quiet "$name"; then
+            systemctl restart "$name"
+            log "restarted $name (was inactive)"
             continue
         fi
 
-        port="\$(grep -oP -- '-L=\S+?://:\K[0-9]+' "\$unit" | head -1)"
-        proto="\$(grep -oP 'ExecStart=.*?-L=\K[a-z]+(?=://)' "\$unit" | head -1)"
-        [ -z "\$port" ] && continue
+        port="$(grep -oP -- '-L=\S+?://:\K[0-9]+' "$unit" | head -1)"
+        proto="$(grep -oP 'ExecStart=.*?-L=\K[a-z]+(?=://)' "$unit" | head -1)"
+        [ -z "$port" ] && continue
 
-        if [ "\$proto" = "udp" ] || [ "\$proto" = "quic" ] || [ "\$proto" = "kcp" ]; then
-            ss -uln 2>/dev/null | grep -qE "[: ]\${port}\b" || { systemctl restart "\$name"; log "restarted \$name (\$proto socket missing on port \$port)"; }
+        if [ "$proto" = "udp" ] || [ "$proto" = "quic" ] || [ "$proto" = "kcp" ]; then
+            ss -uln 2>/dev/null | grep -qE "[: ]${port}\b" || { systemctl restart "$name"; log "restarted $name ($proto socket missing on port $port)"; }
         else
-            timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/\${port}" 2>/dev/null || { systemctl restart "\$name"; log "restarted \$name (\$proto probe failed on port \$port)"; }
+            timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/${port}" 2>/dev/null || { systemctl restart "$name"; log "restarted $name ($proto probe failed on port $port)"; }
         fi
     done
     trim_log
-    sleep "\$INTERVAL"
+    sleep "$INTERVAL"
 done
 WDEOF
     chmod +x "$WATCHDOG_SCRIPT"
@@ -614,7 +659,7 @@ action_install_bbr() {
     echo -e "${C_CYAN}Optional: run external bbr script? (y/n)${C_RESET}"
     read -rp "> " ans
     if [ "$ans" == "y" ]; then
-        wget -qN --no-check-certificate https://github.com/teddysun/across/raw/master/bbr.sh && chmod +x bbr.sh && bash bbr.sh
+        wget $WGET_OPTS -qN --no-check-certificate https://github.com/teddysun/across/raw/master/bbr.sh && chmod +x bbr.sh && bash bbr.sh
     fi
 }
 
@@ -632,38 +677,43 @@ action_uninstall() {
     rm -f /usr/local/bin/gost
     rm -rf "$GOST_DIR"
     rm -f "$SYSCTL_FILE" "$LIMITS_FILE"
+    remove_mss_clamp
     systemctl daemon-reload
-    echo -e "${C_GREEN}Gost uninstalled.${C_RESET}"
+    echo -e "${C_GREEN}Gost uninstalled successfully.${C_RESET}"
 }
 
 main_menu() {
-    banner
-    echo -e "${C_CYAN}1. ${C_RESET}Gost Tunnel By IP4"
-    echo -e "${C_CYAN}2. ${C_RESET}Gost Tunnel By IP6"
-    echo -e "${C_CYAN}3. ${C_RESET}Gost Status"
-    echo -e "${C_CYAN}4. ${C_RESET}Update Script"
-    echo -e "${C_CYAN}5. ${C_RESET}Change Gost Version"
-    echo -e "${C_CYAN}6. ${C_RESET}Auto Restart Gost (timed, blind)"
-    echo -e "${C_CYAN}7. ${C_RESET}Connection Watchdog (auto-heal, ~15s)"
-    echo -e "${C_CYAN}8. ${C_RESET}Auto Clear Cache"
-    echo -e "${C_CYAN}9. ${C_RESET}Apply Speed/Stability Tuning (BBR + Sysctl)"
-    echo -e "${C_CYAN}10. ${C_RESET}Uninstall"
-    echo -e "${C_CYAN}11. ${C_RESET}Exit"
+    while true; do
+        banner
+        echo -e "${C_CYAN}1. ${C_RESET}Gost Tunnel By IP4"
+        echo -e "${C_CYAN}2. ${C_RESET}Gost Tunnel By IP6"
+        echo -e "${C_CYAN}3. ${C_RESET}Gost Status"
+        echo -e "${C_CYAN}4. ${C_RESET}Update Script"
+        echo -e "${C_CYAN}5. ${C_RESET}Change Gost Version"
+        echo -e "${C_CYAN}6. ${C_RESET}Auto Restart Gost (timed, blind)"
+        echo -e "${C_CYAN}7. ${C_RESET}Connection Watchdog (auto-heal, ~15s)"
+        echo -e "${C_CYAN}8. ${C_RESET}Auto Clear Cache"
+        echo -e "${C_CYAN}9. ${C_RESET}Apply Speed/Stability Tuning (BBR + Sysctl)"
+        echo -e "${C_CYAN}10. ${C_RESET}Uninstall"
+        echo -e "${C_CYAN}11. ${C_RESET}Exit"
 
-    local choice; choice=$(read_choice $'\e[97mYour choice: \e[0m' 1 11)
-    case "$choice" in
-        1) action_create_tunnel 4 ;;
-        2) action_create_tunnel 6 ;;
-        3) action_status ;;
-        4) action_update_script ;;
-        5) action_change_version ;;
-        6) action_auto_restart ;;
-        7) action_watchdog ;;
-        8) action_auto_clear_cache ;;
-        9) action_install_bbr ;;
-        10) action_uninstall ;;
-        11) echo -e "${C_GREEN}Bye.${C_RESET}"; exit 0 ;;
-    esac
+        local choice; choice=$(read_choice $'\e[97mYour choice: \e[0m' 1 11)
+        case "$choice" in
+            1) action_create_tunnel 4 ;;
+            2) action_create_tunnel 6 ;;
+            3) action_status ;;
+            4) action_update_script ;;
+            5) action_change_version ;;
+            6) action_auto_restart ;;
+            7) action_watchdog ;;
+            8) action_auto_clear_cache ;;
+            9) action_install_bbr ;;
+            10) action_uninstall ;;
+            11) echo -e "${C_GREEN}Bye.${C_RESET}"; exit 0 ;;
+        esac
+        echo -e "\nPress Enter to return to menu..."
+        read -r
+    done
 }
 
 # ---------- entry point ----------
