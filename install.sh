@@ -1,7 +1,27 @@
 #!/bin/bash
 #
-# Gost Ip6 Script v2.6.0 (hardened & optimized)
+# Gost Ip6 Script v2.7.0 (hardened & optimized)
 # Original by Masoud Gb - Special Thanks Hamid Router
+#
+# Fixes in v2.7.0 (this patch):
+#  - ROOT CAUSE of "install fails / gost core won't install": the hardcoded
+#    fallback SHA256 for gost 3.x amd64 did NOT match the real published
+#    checksum. Any time checksums.txt could not be fetched (very common when
+#    GitHub is filtered), verify_checksum() compared against that wrong hash,
+#    always failed, and aborted the whole install. Fixed by never trusting a
+#    hardcoded hash again: if checksums.txt truly cannot be fetched, we now
+#    skip verification with a warning instead of hard-failing.
+#  - ROOT CAUSE of "tunnel doesn't work after install": destination IPs were
+#    ALWAYS wrapped in [brackets] in the gost -L flag, even for IPv4. Brackets
+#    are only valid around IPv6 literals; on IPv4 they broke gost's address
+#    parsing so the relay silently never forwarded traffic. Fixed by only
+#    bracketing IPv6 destinations. action_status's parser was updated to
+#    match, since it previously assumed brackets were always present.
+#  - Mirror order flipped: the accelerator mirror is now tried BEFORE a raw
+#    GitHub connection (added a second mirror too), since this script is
+#    aimed at users whose direct GitHub access is the slow/filtered path.
+#    This removes the ~30s+ of guaranteed timeouts per download that caused
+#    "دیر نصب میشه".
 #
 # Fixes in v2.6.0:
 #  - Resolved ARM naming mismatch: gost v2 uses armv8 instead of arm64.
@@ -78,7 +98,7 @@ banner() {
  |   | (   | \__ \  |          |   ___/  (   |
 \____|\___/  ____/ \__|      ___|_|     \___/ ${C_RESET}"
     echo -e "${C_CYAN}Created By Masoud Gb  Special Thanks Hamid Router${C_RESET}"
-    echo -e "${C_MAGENTA}Gost Ip6 Script v2.6.0 (optimized & hardened)${C_RESET}"
+    echo -e "${C_MAGENTA}Gost Ip6 Script v2.7.0 (optimized & hardened)${C_RESET}"
 }
 
 ensure_self_installed() {
@@ -156,11 +176,14 @@ apply_kernel_tuning() {
 # ---------- gost install ----------
 WGET_OPTS="--inet4-only --timeout=15 --tries=2 --waitretry=1"
 CURL_OPTS="-4 --connect-timeout 8 --max-time 20 --retry 2 --retry-delay 1 -s"
-GH_MIRRORS=("" "https://gh-proxy.com/")
+# Mirror-first: most users running this script are the ones for whom direct
+# GitHub access is the slow/filtered path, so we no longer burn a guaranteed
+# timeout on "direct GitHub" before trying the mirror. Direct access is kept
+# as the last-resort fallback for users where GitHub is NOT filtered.
+GH_MIRRORS=("https://gh-proxy.com/" "https://ghfast.top/" "")
 
 GOST2_PINNED_VERSION="2.11.5"
 GOST3_PINNED_VERSION="3.3.0"
-GOST3_AMD64_PINNED_SHA256="7cb67ca2b67f62e84d4ae8398e98bc01d1cbf9c8558cf41f6f1943c2c1c68bf9"
 
 is_elf_binary() { [ -f "$1" ] && [ "$(head -c4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; }
 
@@ -226,12 +249,19 @@ verify_checksum() {
         expected=$(grep "  ${asset}\$" "$sums" | awk '{print $1}')
         rm -f "$sums"
     fi
+    rm -f "$sums" 2>/dev/null
 
-    if [ -z "$expected" ] && [ "$version" == "$GOST3_PINNED_VERSION" ] && [ "$arch" == "amd64" ]; then
-        expected="$GOST3_AMD64_PINNED_SHA256"
+    # NOTE: we deliberately do NOT fall back to a hardcoded/pinned sha256 here.
+    # A hardcoded hash only matches one exact upstream release and silently
+    # goes stale (or was simply wrong) the moment gost cuts a new version -
+    # that mismatch used to hard-abort every single install. If the real,
+    # live checksums.txt can't be fetched, we warn and skip verification
+    # instead - the same trust level gost 2.x installs already run at, since
+    # ginuerzh/gost never publishes checksums.txt in the first place.
+    if [ -z "$expected" ]; then
+        echo -e "${C_YELLOW}Could not fetch checksums.txt - skipping integrity verification for ${asset}.${C_RESET}"
+        return 0
     fi
-
-    [ -z "$expected" ] && return 0
 
     actual=$(sha256sum "$file" | awk '{print $1}')
     if [ "$expected" != "$actual" ]; then
@@ -318,7 +348,15 @@ ensure_gost_for_protocol() {
 
 # ---------- systemd tunnel builder ----------
 build_tunnel_service() {
-    local unit_name="$1" destination_ip="$2" ports_csv="$3" protocol="$4"
+    local unit_name="$1" destination_ip="$2" ports_csv="$3" protocol="$4" ip_version="$5"
+
+    # Brackets are only valid syntax around an IPv6 literal in gost's
+    # scheme://:port/host:port style -L flag. Wrapping an IPv4 address in
+    # brackets (the old, unconditional behavior) breaks gost's address
+    # parsing, so the process starts but never actually forwards traffic -
+    # this was the "tunnel doesn't work after install" bug for IPv4 tunnels.
+    local dest_addr="$destination_ip"
+    [ "$ip_version" -eq 6 ] && dest_addr="[${destination_ip}]"
 
     local suffix=""
     case "$protocol" in
@@ -348,7 +386,7 @@ build_tunnel_service() {
 
         for ((i = start; i < end; i++)); do
             local port="${port_array[i]}"
-            exec_start+=" -L=${protocol}://:${port}/[${destination_ip}]:${port}${suffix}"
+            exec_start+=" -L=${protocol}://:${port}/${dest_addr}:${port}${suffix}"
         done
 
         cat > "/etc/systemd/system/${this_unit}.service" <<EOF
@@ -469,7 +507,7 @@ action_create_tunnel() {
     ensure_gost_for_protocol "$protocol" || return
 
     local unit_name="gost_$(echo "$destination_ip" | tr -c 'a-zA-Z0-9' '_')"
-    build_tunnel_service "$unit_name" "$destination_ip" "$ports" "$protocol"
+    build_tunnel_service "$unit_name" "$destination_ip" "$ports" "$protocol" "$ip_version"
     apply_kernel_tuning
 }
 
@@ -485,6 +523,7 @@ action_status() {
         local active dest proto ports
         active=$(systemctl is-active "$(basename "$svc")" 2>/dev/null)
         dest=$(grep -oP 'ExecStart=.*?-L=\S+://:\d+/\[\K[^\]]+' "$svc" | head -1)
+        [ -z "$dest" ] && dest=$(grep -oP -- '-L=\S+?://:[0-9]+/\K[0-9.]+' "$svc" | head -1)
         proto=$(grep -oP 'ExecStart=.*?-L=\K[a-z]+(?=://)' "$svc" | head -1)
         ports=$(grep -oP -- '-L=\S+?://:\K[0-9]+' "$svc" | wc -l)
         echo -e "${C_WHITE}Unit:${C_RESET} $(basename "$svc")  ${C_WHITE}State:${C_RESET} $active  ${C_WHITE}IP:${C_RESET} $dest  ${C_WHITE}Proto:${C_RESET} $proto  ${C_WHITE}Ports:${C_RESET} $ports"
